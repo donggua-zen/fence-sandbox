@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 AI Sandbox Contributors
+//
+// @file version.h.in
+// @brief CMake template for the generated version header.
+//
+// This file is processed by CMake's configure_file() to produce
+// ${CMAKE_BINARY_DIR}/common/version.h. The version numbers are taken
+// from project(AISandbox VERSION x.y.z) in the top-level CMakeLists.txt,
+// which is the single source of truth. Do NOT edit the generated header.
+
+#pragma once
+
+/// Numeric version components.
+#define SANDBOX_VERSION_MAJOR @AISandbox_VERSION_MAJOR@
+#define SANDBOX_VERSION_MINOR @AISandbox_VERSION_MINOR@
+#define SANDBOX_VERSION_PATCH @AISandbox_VERSION_PATCH@
+
+/// Full version string, e.g. "1.0.0".
+#define SANDBOX_VERSION_STRING "@AISandbox_VERSION@"

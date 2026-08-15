@@ -1,0 +1,36 @@
+# Build output
+build/
+build-linux/
+release/
+
+# Test artifacts
+test_ws/
+test_ws_py/
+test_/
+mem-log/
+
+# Sandbox lock files
+.sandbox/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+CMakeSettings.json
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Codely CLI
+.codely-cli/auto-saves/
