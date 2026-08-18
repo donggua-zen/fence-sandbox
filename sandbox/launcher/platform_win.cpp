@@ -2,19 +2,19 @@
 // SPDX-FileCopyrightText: 2026 AI Sandbox Contributors
 //
 // @file platform_win.cpp
-// @brief Windows sandbox implementation using Restricted Token + ACL.
+// @brief Windows sandbox implementation with dual backend strategy.
 //
-// Strategy:
-//   1. Generate a random SID (S-1-5-10-{rand}-...) unique to this invocation.
-//   2. Grant that SID GENERIC_WRITE on each workspace directory via DACL ACE.
-//   3. Create a restricted token (CreateRestrictedToken + WRITE_RESTRICTED)
-//      that only allows writes to objects the SID can access.
-//   4. Launch cmd.exe /c <command> with the restricted token.
-//   5. On completion, remove the ACE and lock file (cleanup).
+// Primary backend (Windows 11 24H2+):
+//   Experimental_CreateProcessInSandbox — AppContainer-based isolation with
+//   declarative filesystem rules via FlatBuffer SandboxSpec. Zero ACL footprint.
 //
-// Why not Low Integrity? Low integrity blocks most read operations, which
-// conflicts with the "read everywhere, write only in workspace" goal.
-// WRITE_RESTRICTED only constrains writes, leaving reads unaffected.
+// Fallback backend (all Windows versions):
+//   Restricted Token + ACL — Generate a random SID, grant it GENERIC_WRITE on
+//   workspace directories, create a WRITE_RESTRICTED token, launch the process.
+//   Cleanup removes the ACE and lock file on completion.
+//
+// Backend selection is capability-probing: load processmodel.dll, resolve the
+// API, attempt the call. If unavailable or it fails, fall back silently.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -56,6 +56,371 @@ static std::wstring utf8ToWide(const std::string& str) {
     std::wstring wide(len - 1, 0);
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &wide[0], len);
     return wide;
+}
+
+/**
+ * @brief Convert a std::wstring to UTF-8 std::string.
+ *
+ * Needed for FlatBuffer sandbox spec, which uses UTF-8 strings.
+ */
+static std::string wideToUtf8(const std::wstring& wide) {
+    if (wide.empty()) return std::string();
+    int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return std::string();
+    std::string utf8(len - 1, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, &utf8[0], len, NULL, NULL);
+    return utf8;
+}
+
+// ============================================================
+//  FlatBuffer SandboxSpec builder for Experimental_CreateProcessInSandbox
+// ============================================================
+//
+// Schema (from Microsoft MXC BaseContainerSpecification.fbs):
+//   table SandboxSpec {
+//     version:string (required);             // field 0
+//     app_container:bool = false;            // field 1
+//     integrity_level:uint32 = 0 (deprecated);  // field 2
+//     disallow_win32k_system_calls:bool = false; // field 3
+//     ui_restrictions:uint64 = 0;            // field 4
+//     least_privilege:bool = false;          // field 5
+//     capabilities:string;                   // field 6
+//     fs_read_write:[string];                // field 7
+//     fs_read_only:[string];                 // field 8
+//     network_policy: NetworkPolicy;         // field 9
+//     integrity:IntegrityLevel = system_default;  // field 10
+//     fs_deny:[string];                      // field 11
+//   }
+//   root_type SandboxSpec;
+//   file_identifier "SBOX";
+
+/**
+ * @brief Build a FlatBuffer SandboxSpec binary blob.
+ *
+ * Only version, app_container, and fs_read_write (or fs_read_only in
+ * read-only mode) are populated. All other fields use schema defaults.
+ *
+ * @param readWritePaths  UTF-8 directory paths with read/write access
+ * @param readOnlyPaths   UTF-8 directory paths with read-only access
+ * @param outBuf          Output buffer receiving the FlatBuffer binary
+ * @return true on success
+ */
+static bool buildSandboxSpec(
+    const std::vector<std::string>& readWritePaths,
+    const std::vector<std::string>& readOnlyPaths,
+    std::vector<uint8_t>& outBuf
+) {
+    outBuf.clear();
+
+    bool hasRW = !readWritePaths.empty();
+    bool hasRO = !readOnlyPaths.empty();
+    const auto& paths = hasRW ? readWritePaths : readOnlyPaths;
+
+    // Lambda helpers for little-endian writes
+    auto writeU16 = [&](uint16_t v) {
+        outBuf.push_back((uint8_t)(v & 0xFF));
+        outBuf.push_back((uint8_t)((v >> 8) & 0xFF));
+    };
+    auto writeU32 = [&](uint32_t v) {
+        outBuf.push_back((uint8_t)(v & 0xFF));
+        outBuf.push_back((uint8_t)((v >> 8) & 0xFF));
+        outBuf.push_back((uint8_t)((v >> 16) & 0xFF));
+        outBuf.push_back((uint8_t)((v >> 24) & 0xFF));
+    };
+    auto writeI32 = [&](int32_t v) { writeU32((uint32_t)v); };
+    auto pad4 = [&]() {
+        while (outBuf.size() % 4 != 0) outBuf.push_back(0);
+    };
+
+    // 1. Header (8 bytes): root offset placeholder + file identifier "SBOX"
+    size_t headerPos = outBuf.size();
+    writeU32(0);  // root offset placeholder (filled in at end)
+    outBuf.push_back('S'); outBuf.push_back('B');
+    outBuf.push_back('O'); outBuf.push_back('X');
+
+    // 2. VTable (9 entries for fields 0-8)
+    pad4();
+    size_t vtablePos = outBuf.size();
+    writeU16(4 + 2 * 9);  // vtable_size = 22
+    writeU16(16);          // table_data_size = 16
+    writeU16(4);   // field 0: version, at table+4
+    writeU16(8);   // field 1: app_container, at table+8
+    writeU16(0);   // field 2: not present
+    writeU16(0);   // field 3: not present
+    writeU16(0);   // field 4: not present
+    writeU16(0);   // field 5: not present
+    writeU16(0);   // field 6: not present
+    writeU16(hasRW ? 12 : 0);  // field 7: fs_read_write
+    writeU16(hasRO ? 12 : 0);  // field 8: fs_read_only
+
+    // 3. Root Table (16 bytes)
+    pad4();  // Align table start to 4 bytes
+    size_t tablePos = outBuf.size();
+    writeI32((int32_t)(tablePos - vtablePos));  // soffset to vtable
+
+    size_t field0Pos = outBuf.size();  // version string offset slot
+    writeU32(0);  // placeholder
+
+    outBuf.push_back(1);  // field 1: app_container = true
+    pad4();  // align for the next uint32 field
+
+    size_t fieldVecPos = outBuf.size();  // vector offset slot
+    writeU32(0);  // placeholder
+
+    // 4. Vector of string offsets (fs_read_write or fs_read_only)
+    pad4();
+    size_t vecPos = outBuf.size();
+    writeU32((uint32_t)paths.size());  // element count
+
+    std::vector<size_t> stringOffsetSlots;
+    for (size_t i = 0; i < paths.size(); i++) {
+        stringOffsetSlots.push_back(outBuf.size());
+        writeU32(0);  // placeholder for string offset
+    }
+
+    // 5. Version string "0.1.0"
+    pad4();
+    size_t versionPos = outBuf.size();
+    const char* ver = "0.1.0";
+    writeU32(5);  // length (excluding null)
+    for (int i = 0; i < 5; i++) outBuf.push_back((uint8_t)ver[i]);
+    outBuf.push_back(0);  // null terminator
+    pad4();
+
+    // 6. Workspace path strings
+    std::vector<size_t> stringPositions;
+    for (const auto& path : paths) {
+        pad4();
+        stringPositions.push_back(outBuf.size());
+        writeU32((uint32_t)path.length());
+        outBuf.insert(outBuf.end(), path.begin(), path.end());
+        outBuf.push_back(0);  // null terminator
+        pad4();
+    }
+
+    // 7. Fill in all offsets (relative to each offset's stored position)
+    // Root table offset
+    uint32_t rootOffset = (uint32_t)tablePos;
+    memcpy(&outBuf[headerPos], &rootOffset, sizeof(rootOffset));
+
+    // Version string offset (relative to field0Pos)
+    uint32_t verOffset = (uint32_t)(versionPos - field0Pos);
+    memcpy(&outBuf[field0Pos], &verOffset, sizeof(verOffset));
+
+    // Vector offset (relative to fieldVecPos)
+    if (!paths.empty()) {
+        uint32_t vecOffset = (uint32_t)(vecPos - fieldVecPos);
+        memcpy(&outBuf[fieldVecPos], &vecOffset, sizeof(vecOffset));
+    }
+
+    // String offsets in vector (relative to each slot position)
+    for (size_t i = 0; i < paths.size(); i++) {
+        uint32_t strOffset = (uint32_t)(stringPositions[i] - stringOffsetSlots[i]);
+        memcpy(&outBuf[stringOffsetSlots[i]], &strOffset, sizeof(strOffset));
+    }
+
+    return true;
+}
+
+// ============================================================
+//  AppContainer profile helpers (required before CreateProcessInSandbox
+//  because the `identity` parameter must match a registered profile)
+// ============================================================
+
+#include <userenv.h>
+#pragma comment(lib, "userenv.lib")  // for CreateAppContainerProfile / DeleteAppContainerProfile
+
+/**
+ * @brief Ensure the AppContainer profile for `identity` exists.
+ *
+ * `CreateAppContainerProfile` is idempotent: if the profile already exists it
+ * returns HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), which we treat as success.
+ * This is required before Experimental_CreateProcessInSandbox will accept the
+ * identity; otherwise the engine may fail with ERROR_CALL_NOT_IMPLEMENTED.
+ *
+ * @param identity  Profile name (wide)
+ * @return true on success (profile exists), false otherwise
+ */
+static bool ensureAppContainerProfile(PCWSTR identity) {
+    PSID unusedSid = NULL;
+    HRESULT hr = CreateAppContainerProfile(
+        identity,
+        identity,             // DisplayName (use identity itself)
+        L"AI Sandbox temp profile",  // Description
+        NULL, 0,              // No extra capabilities
+        &unusedSid
+    );
+    if (SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+        if (unusedSid) FreeSid(unusedSid);
+        return true;
+    }
+    fwprintf(stderr, L"sandbox: [diagnostic] CreateAppContainerProfile(\"%s\") hr=0x%08X\n",
+             identity, (UINT32)hr);
+    if (unusedSid) FreeSid(unusedSid);
+    return false;
+}
+
+// ============================================================
+//  Experimental_CreateProcessInSandbox API types and wrapper
+// ============================================================
+
+typedef BOOL (WINAPI *PFN_Experimental_CreateProcessInSandbox)(
+    _In_opt_ LPCWSTR applicationName,
+    _Inout_opt_ LPWSTR commandLine,
+    _In_opt_ LPSECURITY_ATTRIBUTES processAttributes,
+    _In_opt_ LPSECURITY_ATTRIBUTES threadAttributes,
+    BOOL inheritHandles,
+    DWORD creationFlags,
+    _In_opt_ LPVOID environment,
+    _In_opt_ LPCWSTR currentDirectory,
+    _In_ LPSTARTUPINFOW startupInfo,
+    _In_ LPCWSTR identity,
+    _In_reads_bytes_(sandboxSpecificationSize) LPCVOID sandboxSpecification,
+    DWORD sandboxSpecificationSize,
+    _Out_ LPPROCESS_INFORMATION processInformation
+);
+
+/**
+ * @brief Try running the command via Experimental_CreateProcessInSandbox.
+ *
+ * Probes for processmodel.dll and the experimental API. If unavailable or
+ * the call fails, returns -1 to signal the caller to fall back to the
+ * Restricted Token approach.
+ *
+ * @param cmdLine    Full command line (shell + args + user command)
+ * @param workingDir Working directory for the child process
+ * @param wWorkspaces Workspace directories (for fs_read_write / fs_read_only)
+ * @param readOnly   If true, workspaces are read-only
+ * @return Exit code (>= 0) on success, or -1 to signal fallback
+ */
+static int runWithSandboxApi(
+    const std::wstring& cmdLine,
+    const std::wstring& workingDir,
+    const std::vector<std::wstring>& wWorkspaces,
+    bool readOnly
+) {
+    // 1. Load processmodel.dll from System32
+    HMODULE hMod = LoadLibraryExW(L"processmodel.dll", NULL,
+                                  LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!hMod) return -1;
+
+    auto pfnCreate = (PFN_Experimental_CreateProcessInSandbox)
+        GetProcAddress(hMod, "Experimental_CreateProcessInSandbox");
+    if (!pfnCreate) {
+        FreeLibrary(hMod);
+        return -1;
+    }
+
+    // 2. Build the FlatBuffer SandboxSpec
+    std::vector<std::string> rwPaths, roPaths;
+    if (!readOnly) {
+        for (const auto& ws : wWorkspaces)
+            rwPaths.push_back(wideToUtf8(ws));
+    } else {
+        for (const auto& ws : wWorkspaces)
+            roPaths.push_back(wideToUtf8(ws));
+    }
+
+    std::vector<uint8_t> specBuf;
+    if (!buildSandboxSpec(rwPaths, roPaths, specBuf)) {
+        FreeLibrary(hMod);
+        return -1;
+    }
+
+    // 2.5 Diagnostic: hex dump first 64 bytes of spec to stderr
+    // (temporary for debugging, can be removed later)
+    {
+        fwprintf(stderr, L"sandbox: [diagnostic] SandboxSpec size=%zu bytes, hex:\n",
+                 specBuf.size());
+        for (size_t i = 0; i < specBuf.size(); i += 16) {
+            fwprintf(stderr, L"  %04zu: ", i);
+            for (size_t j = 0; j < 16 && i + j < specBuf.size(); j++)
+                fwprintf(stderr, L"%02X ", specBuf[i + j]);
+            fwprintf(stderr, L"\n");
+        }
+    }
+
+    // 3. Use a stable identity (AppContainer profile is persistent, not ephemeral)
+    //    Then ensure the profile is registered via CreateAppContainerProfile.
+    static const WCHAR kIdentity[] = L"AISandbox.Container.v1";
+    if (!ensureAppContainerProfile(kIdentity)) {
+        // profile registration failed → API won't accept the identity, fall back
+        FreeLibrary(hMod);
+        return -1;
+    }
+
+    // 4. Set up STARTUPINFO with stdio handle passthrough
+    HANDLE hStdin  = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hStderr = GetStdHandle(STD_ERROR_HANDLE);
+
+    // Mark handles as inheritable so the sandbox engine can duplicate them
+    // even though inheritHandles is FALSE.
+    if (hStdin)  SetHandleInformation(hStdin,  HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    if (hStdout) SetHandleInformation(hStdout, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    if (hStderr) SetHandleInformation(hStderr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags     = STARTF_USESTDHANDLES;
+    si.hStdInput   = hStdin;
+    si.hStdOutput  = hStdout;
+    si.hStdError   = hStderr;
+
+    // 5. Build mutable command line buffer
+    WCHAR* cmdCopy = (WCHAR*)LocalAlloc(LPTR,
+        (cmdLine.size() + 1) * sizeof(WCHAR));
+    if (!cmdCopy) { FreeLibrary(hMod); return -1; }
+    wcscpy_s(cmdCopy, cmdLine.size() + 1, cmdLine.c_str());
+
+    // 6. Create Job Object (ensures child is killed if parent dies)
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = { 0 };
+        jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                &jobInfo, sizeof(jobInfo));
+    }
+
+    // 7. Launch the sandboxed process
+    PROCESS_INFORMATION pi = {};
+    BOOL ok = pfnCreate(
+        NULL,               // applicationName (resolve from commandLine)
+        cmdCopy,            // commandLine
+        NULL,               // processAttributes (reserved)
+        NULL,               // threadAttributes (reserved)
+        FALSE,              // inheritHandles (must be FALSE)
+        0,                  // creationFlags
+        NULL,               // environment (inherit parent's)
+        workingDir.c_str(),
+        &si,
+        kIdentity,
+        specBuf.data(),
+        (DWORD)specBuf.size(),
+        &pi
+    );
+
+    LocalFree(cmdCopy);
+
+    if (!ok) {
+        // API call failed — fall back to Restricted Token
+        if (hJob) CloseHandle(hJob);
+        FreeLibrary(hMod);
+        return -1;
+    }
+
+    FreeLibrary(hMod);
+
+    // 8. Associate with Job Object and wait for completion
+    if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    if (hJob) CloseHandle(hJob);
+
+    return (int)exitCode;
 }
 
 // ============================================================
@@ -105,6 +470,21 @@ int run(const Config& cfg) {
                  shell.c_str());
         return 1;
     }
+
+    // --- Build command line: <shell> <args> <command> ---
+    std::wstring cmdLine = shellPath + L" " + shellArgs + wCommand;
+
+    // --- Try modern Windows Sandbox API first (Windows 11 24H2+) ---
+    // Falls back to Restricted Token on older Windows or if the API fails.
+    {
+        int sandboxResult = runWithSandboxApi(cmdLine, wWorkspaces[0], wWorkspaces, cfg.readOnly);
+        if (sandboxResult >= 0) return sandboxResult;
+        // sandboxResult == -1: API unavailable or call failed, fall through
+    }
+
+    // ================================================================
+    //  Fallback: Restricted Token + ACL approach (all Windows versions)
+    // ================================================================
 
     // --- 1. Open current process token for duplication ---
     HANDLE hToken = NULL;
@@ -217,8 +597,7 @@ int run(const Config& cfg) {
     si.hStdOutput  = hParentStdout;
     si.hStdError   = hParentStderr;
 
-    // Build command line: <shell> <args> <command>
-    std::wstring cmdLine = shellPath + L" " + shellArgs + wCommand;
+    // cmdLine was already built above (before the sandbox API attempt)
     WCHAR* cmdCopy = (WCHAR*)LocalAlloc(LPTR, (cmdLine.size() + 1) * sizeof(WCHAR));
     if (cmdCopy) wcscpy_s(cmdCopy, cmdLine.size() + 1, cmdLine.c_str());
 
