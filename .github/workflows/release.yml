@@ -54,6 +54,7 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Test
+        shell: bash
         working-directory: build
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
