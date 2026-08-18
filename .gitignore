@@ -34,3 +34,7 @@ Thumbs.db
 
 # Codely CLI
 .codely-cli/auto-saves/
+
+# Local packaging output
+releasebin/
+dist/

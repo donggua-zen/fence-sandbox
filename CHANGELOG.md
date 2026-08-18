@@ -8,6 +8,8 @@
 
 ### Added
 - Apache-2.0 开源协议
+- CI 自动化：GitHub Actions 三平台（Windows/Linux/macOS）构建+测试+打包，打 `v*` tag 自动发布 Release 附件
+- 本地打包脚本 `package.sh`（按当前平台生成与 CI 一致的压缩包）
 - macOS: Seatbelt (sandbox-exec) 沙盒实现（工作目录内读写、目录外只读、多工作目录与 `--read-only`，支持 `sh`/`bash`/`zsh`，含 `realpath` 规范化与 SBPL 路径转义）
 - 集成测试（跨平台）：工作目录内写入、目录外写入拒绝、只读模式、退出码透传
 - 安全测试套件（16 项用例）：写入/删除/创建目录/移动/读取/多工作区/退出码透传

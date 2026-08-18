@@ -1,0 +1,108 @@
+name: Release
+
+# Build, test and package the sandbox binary for all three platforms
+# (Windows / Linux / macOS), upload the artifacts and, on a `v*` tag push,
+# create a GitHub Release with the binaries attached.
+#
+# Usage:
+#   - Push a tag (e.g. `git tag v1.1.0 && git push origin v1.1.0`) to publish.
+#   - Use the "Run workflow" button to build without publishing a release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create releases / upload assets
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows
+            binary: sandbox.exe
+          - os: ubuntu-latest
+            artifact: linux
+            binary: sandbox
+          - os: macos-latest
+            artifact: macos
+            binary: sandbox
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC toolchain
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Configure
+        run: cmake -S sandbox -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        working-directory: build
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ctest --output-on-failure -C Release
+          else
+            ctest --output-on-failure
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            tar -a -c -f "dist/fence-sandbox-${{ matrix.artifact }}-${ARCH}.zip" \
+              -C build/bin "${{ matrix.binary }}"
+          else
+            tar -czf "dist/fence-sandbox-${{ matrix.artifact }}-${ARCH}.tar.gz" \
+              -C build/bin "${{ matrix.binary }}"
+          fi
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.artifact }}
+          path: dist/
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p releasebin
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} releasebin/ \;
+          ls -la releasebin/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: releasebin/*
+          generate_release_notes: true
