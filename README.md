@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![CI](https://github.com/OWNER/ai-sandbox/actions/workflows/ci.yml/badge.svg)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-orange.svg)
 
 防止 AI 在执行命令时因幻觉写入/删除工作目录外的文件。基于 OS 原生沙盒机制实现，零注入、零钩子。
@@ -19,7 +19,7 @@
 |------|---------|------|
 | Windows | Restricted Token + ACL | ✅ 已实现 |
 | Linux | Landlock LSM | ✅ 已实现 |
-| macOS | Seatbelt (sandbox-exec) | 🔲 待实现 |
+| macOS | Seatbelt (sandbox-exec) | ✅ 已实现 |
 
 ## 系统要求
 
@@ -27,7 +27,7 @@
 |------|------|
 | Windows | Vista 及以上（x64） |
 | Linux | 内核 ≥ 5.13，Docker ≥ 20.10.21（如在容器内运行） |
-| macOS | 待实现 |
+| macOS | macOS 10.10+（自带 `/usr/bin/sandbox-exec`）。注意：`sandbox-exec` 自 macOS 10.15 起被 Apple 标记为 deprecated，但当前仍可用 |
 
 无需额外运行时依赖。构建工具：CMake 3.20+、C++17 编译器（MSVC 2022+ / GCC 12+）。
 
@@ -82,7 +82,7 @@ sandbox -c "<命令>" --workspace <工作目录路径>
 |------|------|
 | `-c`, `--command` | 要执行的命令（必填） |
 | `--workspace` | 工作目录路径（必填），多个用逗号分隔 |
-| `--shell` | 命令执行器：Windows `cmd`/`powershell`（默认 `cmd`），Linux `sh`/`bash`（默认 `sh`） |
+| `--shell` | 命令执行器：Windows `cmd`/`powershell`（默认 `cmd`），Linux `sh`/`bash`（默认 `sh`），macOS `sh`/`bash`/`zsh`（默认 `sh`） |
 | `--read-only` | 只读模式：工作目录也变为只读 |
 | `--version` | 显示版本号并退出 |
 | `-h`, `--help` | 显示帮助 |
@@ -106,6 +106,7 @@ sandbox -c "cat config.yml" --workspace /project --read-only
 sandbox -c "dir" --workspace /project                             # Windows 默认即 cmd
 sandbox -c "Get-ChildItem" --workspace /project --shell powershell  # Windows 切换为 powershell
 sandbox -c "echo hello" --workspace /project --shell bash            # Linux 切换为 bash
+sandbox -c "echo hello" --workspace /project --shell zsh             # macOS 切换为 zsh
 
 # 中文/带空格目录
 sandbox -c "echo hello" --workspace "/我的项目/代码"
@@ -187,7 +188,7 @@ proc.on('exit', (code) => {
 
 ## 注意事项
 
-- Windows: 命令默认通过 `cmd.exe /c` 执行，可用 `--shell powershell` 切换为 `powershell.exe -NoProfile -NonInteractive -Command`；Linux: 命令默认通过 `sh -c` 执行，可用 `--shell bash` 切换为 `bash -c`
+- Windows: 命令默认通过 `cmd.exe /c` 执行，可用 `--shell powershell` 切换为 `powershell.exe -NoProfile -NonInteractive -Command`；Linux: 命令默认通过 `sh -c` 执行，可用 `--shell bash` 切换为 `bash -c`；macOS: 命令默认通过 `sh -c` 执行，可用 `--shell bash`/`--shell zsh` 切换，经 `/usr/bin/sandbox-exec` 应用 Seatbelt 沙箱
 - 工作目录路径不存在时会自动创建
 - Windows: `.sandbox/` 目录用于存放 lock 文件（隐藏属性），请勿手动删除
 - Linux: 无额外文件，无残留

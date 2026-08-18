@@ -13,7 +13,7 @@
 |------|---------|---------|
 | Windows | Restricted Token + ACL | 生成随机 SID，仅授予该 SID 对工作目录的写权限，用受限令牌启动子进程 |
 | Linux | Landlock LSM | 创建 Landlock ruleset 限制写操作，为工作目录添加"允许写入"规则 |
-| macOS | sandbox-exec (Seatbelt) | 待实现 |
+| macOS | sandbox-exec (Seatbelt) | 生成动态 SBPL profile，默认放行一切、仅拒绝工作目录之外的写入 |
 
 ## Windows: Restricted Token + ACL
 
@@ -53,6 +53,38 @@
 ### 安全失败
 
 如果运行环境不支持 Landlock（内核 < 5.13 或 Docker seccomp 拦截了 landlock syscall），sandbox 会输出明确的错误信息并退出，**不会静默降级为无保护运行**。
+
+
+## macOS: sandbox-exec (Seatbelt)
+
+### 流程
+
+1. **解析工作目录**：将每个工作目录递归创建（如缺失）并 `realpath()` 解析为规范绝对路径。Seatbelt 的 `subpath` 过滤器按内核解析后的路径匹配（例如 `/var` 是 `/private/var` 的符号链接），因此必须使用规范路径，否则即使在工作目录内写入也会被误拒绝
+2. **生成 SBPL profile**：默认放行一切操作（`allow default`），仅拒绝工作目录之外的写入。`--read-only` 模式则拒绝所有写入：
+   ```
+   (version 1)
+   (allow default)
+   (deny file-write* (require-all (subpath "/")
+       (require-not (subpath "<工作目录真实路径1>"))
+       (require-not (subpath "<工作目录真实路径2>"))))
+   ```
+3. **写入临时文件**：用 `mkstemp` 生成 `/tmp/fence-sandbox.XXXXXX` 保存 profile
+4. **Fork**：子进程 `chdir` 到首个工作目录，然后 `execl` 执行 `/usr/bin/sandbox-exec -f <profile> <shell> -c <命令>`
+5. **父进程**：转发信号、`waitpid` 等待、透传退出码，结束后删除临时 profile
+
+### 与 Linux 的对应关系
+
+| 语义 | Linux (Landlock) | macOS (Seatbelt) |
+|------|------------------|------------------|
+| 允许写工作目录 | 为每个目录添加 path-beneath 写规则 | 每个目录生成一条 `require-not (subpath ...)` |
+| 只读模式 | 不添加任何写规则 | 直接 `(deny file-write*)` |
+| 目录外写/删拒绝 | 内核强制 | Seatbelt 强制 |
+| 读/网络/CPU 不限制 | 未受限 | 默认放行 |
+
+### 局限
+
+- `/usr/bin/sandbox-exec` 自 macOS 10.15 起被 Apple 标记为 deprecated，当前版本仍可用，但长期稳定性不确定
+- 工作目录路径包含 `"` 或 `\` 时，会在嵌入 SBPL 前转义（`\`→`\\`、`"`→`\"`），避免破坏 profile 语法
 
 ## 透明性保证
 

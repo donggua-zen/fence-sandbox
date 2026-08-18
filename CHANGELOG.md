@@ -8,6 +8,7 @@
 
 ### Added
 - Apache-2.0 开源协议
+- macOS: Seatbelt (sandbox-exec) 沙盒实现（工作目录内读写、目录外只读、多工作目录与 `--read-only`，支持 `sh`/`bash`/`zsh`，含 `realpath` 规范化与 SBPL 路径转义）
 - 集成测试（跨平台）：工作目录内写入、目录外写入拒绝、只读模式、退出码透传
 - 安全测试套件（16 项用例）：写入/删除/创建目录/移动/读取/多工作区/退出码透传
 - GitHub Actions CI（Windows + Linux）

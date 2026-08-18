@@ -1,5 +1,5 @@
 # sandbox -- AI Sandbox Launcher
-# Platform-specific: Windows (Restricted Token + ACL) / Linux (Landlock)
+# Platform-specific: Windows (Restricted Token + ACL) / Linux (Landlock) / macOS (Seatbelt)
 
 add_executable(sandbox
     main.cpp
@@ -8,6 +8,8 @@ add_executable(sandbox
 # Platform-specific source
 if(WIN32)
     target_sources(sandbox PRIVATE platform_win.cpp)
+elseif(APPLE)
+    target_sources(sandbox PRIVATE platform_mac.cpp)
 else()
     target_sources(sandbox PRIVATE platform_linux.cpp)
 endif()
