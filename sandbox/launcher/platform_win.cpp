@@ -458,13 +458,14 @@ int run(const Config& cfg) {
     std::wstring shell = utf8ToWide(cfg.shell);
     std::wstring shellPath;
     std::wstring shellArgs;
-    if (shell.empty() || _wcsicmp(shell.c_str(), L"cmd") == 0) {
-        shellPath = L"cmd.exe";
-        shellArgs = L"/c ";
-    } else if (_wcsicmp(shell.c_str(), L"powershell") == 0 ||
-               _wcsicmp(shell.c_str(), L"ps") == 0) {
+    if (shell.empty() || _wcsicmp(shell.c_str(), L"powershell") == 0 ||
+        _wcsicmp(shell.c_str(), L"ps") == 0) {
+        // Default shell is PowerShell (matches config.h documentation).
         shellPath = L"powershell.exe";
         shellArgs = L"-NoProfile -NonInteractive -Command ";
+    } else if (_wcsicmp(shell.c_str(), L"cmd") == 0) {
+        shellPath = L"cmd.exe";
+        shellArgs = L"/c ";
     } else {
         fwprintf(stderr, L"sandbox: unsupported shell '%s' (Windows supports: powershell, cmd)\n",
                  shell.c_str());

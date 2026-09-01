@@ -82,7 +82,7 @@ sandbox -c "<命令>" --workspace <工作目录路径>
 |------|------|
 | `-c`, `--command` | 要执行的命令（必填） |
 | `--workspace` | 工作目录路径（必填），多个用逗号分隔 |
-| `--shell` | 命令执行器：Windows `cmd`/`powershell`（默认 `cmd`），Linux `sh`/`bash`（默认 `sh`），macOS `sh`/`bash`/`zsh`（默认 `sh`） |
+| `--shell` | 命令执行器：Windows `powershell`/`cmd`（默认 `powershell`），Linux `sh`/`bash`（默认 `sh`），macOS `sh`/`bash`/`zsh`（默认 `sh`） |
 | `--read-only` | 只读模式：工作目录也变为只读 |
 | `--version` | 显示版本号并退出 |
 | `-h`, `--help` | 显示帮助 |
@@ -103,8 +103,8 @@ sandbox -c "npm install" --workspace /project/src,/project/shared
 sandbox -c "cat config.yml" --workspace /project --read-only
 
 # 指定命令执行器
-sandbox -c "dir" --workspace /project                             # Windows 默认即 cmd
-sandbox -c "Get-ChildItem" --workspace /project --shell powershell  # Windows 切换为 powershell
+sandbox -c "Get-ChildItem" --workspace /project                     # Windows 默认即 powershell
+sandbox -c "dir" --workspace /project --shell cmd                    # Windows 切换为 cmd
 sandbox -c "echo hello" --workspace /project --shell bash            # Linux 切换为 bash
 sandbox -c "echo hello" --workspace /project --shell zsh             # macOS 切换为 zsh
 
@@ -161,7 +161,7 @@ proc.on('exit', (code) => {
 1. **生成随机 SID**：每次执行生成 `S-1-5-10-{rand}-{rand}-{rand}-{rand}` 格式的唯一标识
 2. **授予写权限**：将该 SID 的 `GENERIC_WRITE | GENERIC_EXECUTE` ACE 添加到工作目录的 DACL
 3. **创建 Restricted Token**：用 `CreateRestrictedToken` + `WRITE_RESTRICTED` 限制令牌，仅允许写该 SID 有权访问的目录
-4. **启动子进程**：用受限令牌执行 `<命令>`（默认 `cmd.exe /c`，`--shell powershell` 切换为 `powershell.exe -NoProfile -NonInteractive -Command`），工作目录内可读写，目录外自动拒绝
+4. **启动子进程**：用受限令牌执行 `<命令>`（默认 `powershell.exe -NoProfile -NonInteractive -Command`，`--shell cmd` 切换为 `cmd.exe /c`），工作目录内可读写，目录外自动拒绝
 5. **清理**：执行完毕后删除 ACE，删除 lock 文件
 
 **心跳与僵尸清理**：后台线程每 10 分钟更新 lock 文件时间戳，每次启动时自动清理超过 30 分钟未更新的残留 ACE。
@@ -188,7 +188,7 @@ proc.on('exit', (code) => {
 
 ## 注意事项
 
-- Windows: 命令默认通过 `cmd.exe /c` 执行，可用 `--shell powershell` 切换为 `powershell.exe -NoProfile -NonInteractive -Command`；Linux: 命令默认通过 `sh -c` 执行，可用 `--shell bash` 切换为 `bash -c`；macOS: 命令默认通过 `sh -c` 执行，可用 `--shell bash`/`--shell zsh` 切换，经 `/usr/bin/sandbox-exec` 应用 Seatbelt 沙箱
+- Windows: 命令默认通过 `powershell.exe -NoProfile -NonInteractive -Command` 执行，可用 `--shell cmd` 切换为 `cmd.exe /c`；Linux: 命令默认通过 `sh -c` 执行，可用 `--shell bash` 切换为 `bash -c`；macOS: 命令默认通过 `sh -c` 执行，可用 `--shell bash`/`--shell zsh` 切换，经 `/usr/bin/sandbox-exec` 应用 Seatbelt 沙箱
 - 工作目录路径不存在时会自动创建
 - Windows: `.sandbox/` 目录用于存放 lock 文件（隐藏属性），请勿手动删除
 - Linux: 无额外文件，无残留

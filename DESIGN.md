@@ -22,7 +22,7 @@
 1. **生成随机 SID**：每次执行通过 `CryptGenRandom` 生成 `S-1-5-10-{rand}-{rand}-{rand}-{rand}` 格式的唯一标识
 2. **授予写权限**：将该 SID 的 `GENERIC_WRITE | GENERIC_EXECUTE` ACE 添加到工作目录的 DACL
 3. **创建 Restricted Token**：用 `CreateRestrictedToken` + `WRITE_RESTRICTED` 限制令牌，添加 `Everyone` SID 作为 restricting SID，使子进程仅能写该 SID 有权访问的目录
-4. **启动子进程**：用 `CreateProcessAsUserW` 以受限令牌执行 `cmd.exe /c <命令>`
+4. **启动子进程**：用 `CreateProcessAsUserW` 以受限令牌执行 `powershell.exe -NoProfile -NonInteractive -Command <命令>`（`--shell cmd` 切换为 `cmd.exe /c`）
 5. **清理**：执行完毕后删除 ACE 和 lock 文件
 
 ### 心跳与僵尸清理
