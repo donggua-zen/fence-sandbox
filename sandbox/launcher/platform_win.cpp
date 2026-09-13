@@ -454,6 +454,34 @@ static bool isSidActive(PCWSTR workspace, PSID sid);
 static void getLockFilePath(PCWSTR workspace, PSID sid, WCHAR* path, DWORD pathSize);
 static DWORD WINAPI LockUpdateThreadProc(LPVOID lpParameter);
 
+/**
+ * @brief Stop the heartbeat thread and roll back granted ACEs / lock files.
+ *
+ * Shared by every failure path after step 3 (ACL + lock setup) and by the
+ * normal-exit cleanup. Must run before the process exits: the heartbeat
+ * thread touches the lock files, so it is terminated first.
+ *
+ * @param hHeartbeatThread  Heartbeat thread handle (may be NULL)
+ * @param wWorkspaces       Workspace directories (wide)
+ * @param workspaceSid      Sandbox SID whose ACEs / lock files are removed
+ */
+static void cleanupWorkspaceGrants(
+    HANDLE hHeartbeatThread,
+    const std::vector<std::wstring>& wWorkspaces,
+    PSID workspaceSid
+) {
+    if (hHeartbeatThread) {
+        TerminateThread(hHeartbeatThread, 0);
+        CloseHandle(hHeartbeatThread);
+    }
+    if (CLEANUP_AFTER_EACH_COMMAND) {
+        for (const auto& ws : wWorkspaces) {
+            deleteLockFile(ws.c_str(), workspaceSid);
+            removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
+        }
+    }
+}
+
 // ============================================================
 //  Main entry: set up sandbox and launch command
 // ============================================================
@@ -528,11 +556,24 @@ int run(const Config& cfg) {
     }
     if (!cfg.readOnly) {
         // --- 3. Grant write access on each workspace dir + create lock files ---
+        // Fail closed: without its ACE the workspace is unwritable and the
+        // command can never succeed — abort instead of running with a
+        // half-configured sandbox.
         for (const auto& ws : wWorkspaces) {
             if (!ensureWorkspaceWriteAcl(ws.c_str(), workspaceSid)) {
                 fwprintf(stderr, L"sandbox: ACL setup failed for %s\n", ws.c_str());
+                cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
+                LocalFree(workspaceSid);
+                CloseHandle(hToken);
+                return 1;
             }
-            createLockFile(ws.c_str(), workspaceSid);
+            if (!createLockFile(ws.c_str(), workspaceSid)) {
+                fwprintf(stderr, L"sandbox: cannot create lock file in %s\n", ws.c_str());
+                cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
+                LocalFree(workspaceSid);
+                CloseHandle(hToken);
+                return 1;
+            }
         }
 
         // --- 3.5 Start heartbeat thread for lock file maintenance ---
@@ -566,15 +607,7 @@ int run(const Config& cfg) {
 
     if (!ok) {
         fwprintf(stderr, L"sandbox: CreateRestrictedToken (%lu)\n", GetLastError());
-        if (!cfg.readOnly) {
-            if (hHeartbeatThread) { TerminateThread(hHeartbeatThread, 0); CloseHandle(hHeartbeatThread); }
-            for (const auto& ws : wWorkspaces) {
-                if (CLEANUP_AFTER_EACH_COMMAND) {
-                    deleteLockFile(ws.c_str(), workspaceSid);
-                    removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
-                }
-            }
-        }
+        if (!cfg.readOnly) cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
         LocalFree(workspaceSid);
         return 1;
     }
@@ -623,15 +656,7 @@ int run(const Config& cfg) {
         fwprintf(stderr, L"sandbox: CreateProcessAsUserW (%lu)\n", GetLastError());
         CloseHandle(hRestrictedToken);
         if (hJob) CloseHandle(hJob);
-        if (!cfg.readOnly) {
-            if (hHeartbeatThread) { TerminateThread(hHeartbeatThread, 0); CloseHandle(hHeartbeatThread); }
-            for (const auto& ws : wWorkspaces) {
-                if (CLEANUP_AFTER_EACH_COMMAND) {
-                    deleteLockFile(ws.c_str(), workspaceSid);
-                    removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
-                }
-            }
-        }
+        if (!cfg.readOnly) cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
         LocalFree(workspaceSid);
         return 1;
     }
@@ -654,17 +679,7 @@ int run(const Config& cfg) {
 
     // --- 8. Stop heartbeat thread and clean up ACEs / lock files ---
     if (!cfg.readOnly) {
-        if (hHeartbeatThread) {
-            TerminateThread(hHeartbeatThread, 0);
-            CloseHandle(hHeartbeatThread);
-        }
-
-        if (CLEANUP_AFTER_EACH_COMMAND) {
-            for (const auto& ws : wWorkspaces) {
-                deleteLockFile(ws.c_str(), workspaceSid);
-                removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
-            }
-        }
+        cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
     }
 
     LocalFree(workspaceSid);
@@ -1013,8 +1028,10 @@ bool removeWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
         NULL, NULL, &dacl, NULL, &sd);
     if (err != ERROR_SUCCESS || !dacl) { LocalFree(sd); return false; }
 
-    // Count ACEs that are NOT owned by the target SID (to keep)
-    DWORD keepCount = 0;
+    // Size the new DACL from the real ACE sizes. A per-ACE estimate is always
+    // too small (real ACEs carry their SID; sizeof(ACCESS_ALLOWED_ACE) does
+    // not) and would produce a truncated DACL whose AddAce calls fail.
+    DWORD keepCount = 0, keepSize = sizeof(ACL);
     for (DWORD i = 0; i < dacl->AceCount; i++) {
         ACE_HEADER* ace = NULL;
         if (!GetAce(dacl, i, (void**)&ace)) continue;
@@ -1023,16 +1040,20 @@ bool removeWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
             aceSid = (PSID)&((ACCESS_ALLOWED_ACE*)ace)->SidStart;
         else if (ace->AceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE)
             aceSid = (PSID)&((ACCESS_ALLOWED_CALLBACK_ACE*)ace)->SidStart;
-        else { keepCount++; continue; }
-        if (!EqualSid(aceSid, sid)) keepCount++;
+        else { keepCount++; keepSize += ace->AceSize; continue; }
+        if (!EqualSid(aceSid, sid)) { keepCount++; keepSize += ace->AceSize; }
     }
 
     // Rebuild DACL without the target SID's ACEs
-    DWORD newSize = sizeof(ACL) + keepCount * sizeof(ACCESS_ALLOWED_ACE);
-    PACL newDacl = (PACL)LocalAlloc(LPTR, newSize);
+    PACL newDacl = (PACL)LocalAlloc(LPTR, keepSize);
     if (!newDacl) { LocalFree(sd); return false; }
-    InitializeAcl(newDacl, newSize, ACL_REVISION);
+    if (!InitializeAcl(newDacl, keepSize, ACL_REVISION)) {
+        LocalFree(newDacl);
+        LocalFree(sd);
+        return false;
+    }
 
+    BOOL aclComplete = TRUE;
     for (DWORD i = 0; i < dacl->AceCount; i++) {
         ACE_HEADER* ace = NULL;
         if (!GetAce(dacl, i, (void**)&ace)) continue;
@@ -1041,16 +1062,24 @@ bool removeWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
             aceSid = (PSID)&((ACCESS_ALLOWED_ACE*)ace)->SidStart;
         else if (ace->AceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE)
             aceSid = (PSID)&((ACCESS_ALLOWED_CALLBACK_ACE*)ace)->SidStart;
-        else { AddAce(newDacl, ACL_REVISION, MAXDWORD, ace, ace->AceSize); continue; }
-        // Keep all ACEs except those matching the target SID
-        if (!EqualSid(aceSid, sid))
-            AddAce(newDacl, ACL_REVISION, MAXDWORD, ace, ace->AceSize);
+        if (aceSid && EqualSid(aceSid, sid)) continue;
+        // Never write back a partially built DACL: a failed AddAce would
+        // silently drop the remaining ACEs (e.g. the user's own access)
+        // from the directory.
+        if (!AddAce(newDacl, ACL_REVISION, MAXDWORD, ace, ace->AceSize)) {
+            aclComplete = FALSE;
+            break;
+        }
     }
 
-    err = SetNamedSecurityInfoW(
-        (LPWSTR)workspace, SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        NULL, NULL, newDacl, NULL);
+    if (aclComplete) {
+        err = SetNamedSecurityInfoW(
+            (LPWSTR)workspace, SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            NULL, NULL, newDacl, NULL);
+    } else {
+        err = ERROR_INVALID_ACL;
+    }
     LocalFree(newDacl);
     LocalFree(sd);
     return err == ERROR_SUCCESS;
