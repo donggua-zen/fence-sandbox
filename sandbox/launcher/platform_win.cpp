@@ -514,17 +514,19 @@ int run(const Config& cfg) {
         return 1;
     }
 
-    // --- 2. Generate random workspace SID (skipped in read-only mode) ---
+    // --- 2. Generate random workspace SID ---
+    // Doubles as the token's only restricting SID (step 4). In read-only mode
+    // it is never granted any ACE, so every write via the restricted token is
+    // denied (matches Linux/macOS read-only semantics).
     PSID workspaceSid = NULL;
     HANDLE hHeartbeatThread = NULL;
     std::vector<std::pair<std::wstring, PSID>> wsList;
+    if (!generateRandomSid(&workspaceSid)) {
+        fwprintf(stderr, L"sandbox: SID generation failed\n");
+        CloseHandle(hToken);
+        return 1;
+    }
     if (!cfg.readOnly) {
-        if (!generateRandomSid(&workspaceSid)) {
-            fwprintf(stderr, L"sandbox: SID generation failed\n");
-            CloseHandle(hToken);
-            return 1;
-        }
-
         // --- 3. Grant write access on each workspace dir + create lock files ---
         for (const auto& ws : wWorkspaces) {
             if (!ensureWorkspaceWriteAcl(ws.c_str(), workspaceSid)) {
@@ -541,46 +543,26 @@ int run(const Config& cfg) {
     }
 
     // --- 4. Create Restricted Token ---
-    // Add Everyone SID as a restricting SID so that the token can only write
-    // to objects explicitly granting access to one of the restricting SIDs.
-    PSID everyoneSid = NULL, logonSid = NULL;
-    ConvertStringSidToSidW(L"S-1-1-0", &everyoneSid);
-    if (!cfg.readOnly) {
-        // Extract the logon SID from the current token (needed for restricting)
-        DWORD bufSize = 0;
-        GetTokenInformation(hToken, TokenGroups, NULL, 0, &bufSize);
-        PTOKEN_GROUPS groups = (PTOKEN_GROUPS)LocalAlloc(LPTR, bufSize);
-        if (groups && GetTokenInformation(hToken, TokenGroups, groups, bufSize, &bufSize)) {
-            for (DWORD i = 0; i < groups->GroupCount; i++) {
-                if (groups->Groups[i].Attributes & SE_GROUP_LOGON_ID) {
-                    DWORD len = GetLengthSid(groups->Groups[i].Sid);
-                    logonSid = (PSID)LocalAlloc(LPTR, len);
-                    if (logonSid) CopySid(len, logonSid, groups->Groups[i].Sid);
-                    break;
-                }
-            }
-        }
-        LocalFree(groups);
-    }
-
-    // Build the list of restricting SIDs for CreateRestrictedToken
-    SID_AND_ATTRIBUTES restrictingSids[3] = {};
-    DWORD numRestricting = 0;
-    if (everyoneSid)  { restrictingSids[numRestricting].Sid = everyoneSid; numRestricting++; }
-    if (!cfg.readOnly && logonSid)     { restrictingSids[numRestricting].Sid = logonSid;     numRestricting++; }
-    if (!cfg.readOnly && workspaceSid) { restrictingSids[numRestricting].Sid = workspaceSid; numRestricting++; }
+    // WRITE_RESTRICTED consults restricting SIDs only for write-type accesses;
+    // reads keep using the token's normal user SIDs. Restrict to the random
+    // workspace SID alone: a write then requires an ACE explicitly granting
+    // that SID, which only the workspace has. Previously Everyone and the
+    // logon SID were restricting SIDs too, letting the child write anywhere
+    // those SIDs had write access (e.g. ACL-less FAT/exFAT volumes, where
+    // Everyone is implicitly granted) — including --read-only mode, whose
+    // restricting set consisted of Everyone alone.
+    SID_AND_ATTRIBUTES restrictingSids[1] = {};
+    restrictingSids[0].Sid = workspaceSid;
 
     HANDLE hRestrictedToken = NULL;
     BOOL ok = CreateRestrictedToken(
         hToken,
         DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
         0, NULL,          0, NULL,
-        numRestricting, restrictingSids,
+        1, restrictingSids,
         &hRestrictedToken
     );
     CloseHandle(hToken);
-    LocalFree(everyoneSid);
-    LocalFree(logonSid);
 
     if (!ok) {
         fwprintf(stderr, L"sandbox: CreateRestrictedToken (%lu)\n", GetLastError());
