@@ -281,6 +281,26 @@ typedef BOOL (WINAPI *PFN_Experimental_CreateProcessInSandbox)(
 );
 
 /**
+ * @brief Create a Job Object with KILL_ON_JOB_CLOSE so the sandboxed child
+ *        and its descendants die when the launcher exits.
+ *
+ * @return Job handle, or NULL on failure (protection is best-effort)
+ */
+static HANDLE createKillOnCloseJob() {
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (!hJob) return NULL;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = { 0 };
+    jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                 &jobInfo, sizeof(jobInfo))) {
+        fwprintf(stderr, L"sandbox: job object setup failed (%lu)\n", GetLastError());
+        CloseHandle(hJob);
+        return NULL;
+    }
+    return hJob;
+}
+
+/**
  * @brief Try running the command via Experimental_CreateProcessInSandbox.
  *
  * Probes for processmodel.dll and the experimental API. If unavailable or
@@ -465,26 +485,6 @@ static void cleanupWorkspaceGrants(
             removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
         }
     }
-}
-
-/**
- * @brief Create a Job Object with KILL_ON_JOB_CLOSE so the sandboxed child
- *        and its descendants die when the launcher exits.
- *
- * @return Job handle, or NULL on failure (protection is best-effort)
- */
-static HANDLE createKillOnCloseJob() {
-    HANDLE hJob = CreateJobObjectW(NULL, NULL);
-    if (!hJob) return NULL;
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = { 0 };
-    jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
-                                 &jobInfo, sizeof(jobInfo))) {
-        fwprintf(stderr, L"sandbox: job object setup failed (%lu)\n", GetLastError());
-        CloseHandle(hJob);
-        return NULL;
-    }
-    return hJob;
 }
 
 // ============================================================
