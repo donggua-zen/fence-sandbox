@@ -189,6 +189,7 @@ proc.on('exit', (code) => {
 ## 注意事项
 
 - Windows: 命令默认通过 `powershell.exe -NoProfile -NonInteractive -Command` 执行，可用 `--shell cmd` 切换为 `cmd.exe /c`；Linux: 命令默认通过 `sh -c` 执行，可用 `--shell bash` 切换为 `bash -c`；macOS: 命令默认通过 `sh -c` 执行，可用 `--shell bash`/`--shell zsh` 切换，经 `/usr/bin/sandbox-exec` 应用 Seatbelt 沙箱
+- Windows: 受限令牌启动的 `powershell.exe` 在部分环境（如 GitHub Windows runner）会阻塞，CI 通过 `SANDBOX_TEST_SKIP_DEFAULT_SHELL` 跳过默认 shell 用例；Win11 24H2+ Sandbox API（AppContainer）路径仍待真机验证
 - 工作目录路径不存在时会自动创建
 - Windows: `.sandbox/` 目录用于存放 lock 文件（隐藏属性），请勿手动删除
 - Linux: 无额外文件，无残留
