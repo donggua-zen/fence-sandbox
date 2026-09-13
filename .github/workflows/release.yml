@@ -54,11 +54,10 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      # Windows test skipped: powershell.exe under the restricted token
-      # (default shell since 4c12a93) hangs indefinitely on GitHub runners.
-      # Run the tests locally on Windows before tagging a release.
+      # SANDBOX_TEST_SKIP_DEFAULT_SHELL (set in tests/CMakeLists.txt) skips
+      # the default-shell (powershell) cases on Windows, which hang under the
+      # write-restricted token on GitHub runners.
       - name: Test
-        if: runner.os != 'Windows'
         working-directory: build
         run: ctest --output-on-failure
 

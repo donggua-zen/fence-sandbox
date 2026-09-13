@@ -22,10 +22,14 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      # No Test step on Windows: powershell.exe spawned under the restricted
-      # token (default shell since 4c12a93) hangs indefinitely on GitHub
-      # runners, so ctest never returns. Run the tests locally on Windows:
-      #   ctest --test-dir build -C Release --output-on-failure
+      # Default-shell (powershell) cases are skipped via
+      # SANDBOX_TEST_SKIP_DEFAULT_SHELL — set in tests/CMakeLists.txt —
+      # because powershell.exe hangs under the write-restricted token on
+      # GitHub runners. The cmd-only subset still covers the Restricted
+      # Token backend that runs on these runners.
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure -C Release
 
   linux:
     runs-on: ubuntu-latest

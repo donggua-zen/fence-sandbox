@@ -281,34 +281,62 @@ typedef BOOL (WINAPI *PFN_Experimental_CreateProcessInSandbox)(
 );
 
 /**
+ * @brief Create a Job Object with KILL_ON_JOB_CLOSE so the sandboxed child
+ *        and its descendants die when the launcher exits.
+ *
+ * @return Job handle, or NULL on failure (protection is best-effort)
+ */
+static HANDLE createKillOnCloseJob() {
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (!hJob) return NULL;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = { 0 };
+    jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                 &jobInfo, sizeof(jobInfo))) {
+        fwprintf(stderr, L"sandbox: job object setup failed (%lu)\n", GetLastError());
+        CloseHandle(hJob);
+        return NULL;
+    }
+    return hJob;
+}
+
+/**
  * @brief Try running the command via Experimental_CreateProcessInSandbox.
  *
  * Probes for processmodel.dll and the experimental API. If unavailable or
- * the call fails, returns -1 to signal the caller to fall back to the
+ * the call fails, returns false to signal the caller to fall back to the
  * Restricted Token approach.
+ *
+ * The exit code is reported through an out parameter — it must never share
+ * a channel with the "should fall back" signal: child processes legitimately
+ * exit with 0xFFFFFFFF (-1), which would otherwise trigger a second run of
+ * the same command via the fallback backend.
  *
  * @param cmdLine    Full command line (shell + args + user command)
  * @param workingDir Working directory for the child process
  * @param wWorkspaces Workspace directories (for fs_read_write / fs_read_only)
  * @param readOnly   If true, workspaces are read-only
- * @return Exit code (>= 0) on success, or -1 to signal fallback
+ * @param exitCodeOut Receives the child's exit code when true is returned
+ * @return true if the command was executed via the sandbox API, false if the
+ *         caller should fall back
  */
-static int runWithSandboxApi(
+static bool runWithSandboxApi(
     const std::wstring& cmdLine,
     const std::wstring& workingDir,
     const std::vector<std::wstring>& wWorkspaces,
-    bool readOnly
+    bool readOnly,
+    int* exitCodeOut
 ) {
     // 1. Load processmodel.dll from System32
     HMODULE hMod = LoadLibraryExW(L"processmodel.dll", NULL,
                                   LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!hMod) return -1;
+    if (!hMod) return false;
 
     auto pfnCreate = (PFN_Experimental_CreateProcessInSandbox)
         GetProcAddress(hMod, "Experimental_CreateProcessInSandbox");
     if (!pfnCreate) {
         FreeLibrary(hMod);
-        return -1;
+        return false;
     }
 
     // 2. Build the FlatBuffer SandboxSpec
@@ -324,20 +352,7 @@ static int runWithSandboxApi(
     std::vector<uint8_t> specBuf;
     if (!buildSandboxSpec(rwPaths, roPaths, specBuf)) {
         FreeLibrary(hMod);
-        return -1;
-    }
-
-    // 2.5 Diagnostic: hex dump first 64 bytes of spec to stderr
-    // (temporary for debugging, can be removed later)
-    {
-        fwprintf(stderr, L"sandbox: [diagnostic] SandboxSpec size=%zu bytes, hex:\n",
-                 specBuf.size());
-        for (size_t i = 0; i < specBuf.size(); i += 16) {
-            fwprintf(stderr, L"  %04zu: ", i);
-            for (size_t j = 0; j < 16 && i + j < specBuf.size(); j++)
-                fwprintf(stderr, L"%02X ", specBuf[i + j]);
-            fwprintf(stderr, L"\n");
-        }
+        return false;
     }
 
     // 3. Use a stable identity (AppContainer profile is persistent, not ephemeral)
@@ -346,7 +361,7 @@ static int runWithSandboxApi(
     if (!ensureAppContainerProfile(kIdentity)) {
         // profile registration failed → API won't accept the identity, fall back
         FreeLibrary(hMod);
-        return -1;
+        return false;
     }
 
     // 4. Set up STARTUPINFO with stdio handle passthrough
@@ -369,17 +384,11 @@ static int runWithSandboxApi(
     // 5. Build mutable command line buffer
     WCHAR* cmdCopy = (WCHAR*)LocalAlloc(LPTR,
         (cmdLine.size() + 1) * sizeof(WCHAR));
-    if (!cmdCopy) { FreeLibrary(hMod); return -1; }
+    if (!cmdCopy) { FreeLibrary(hMod); return false; }
     wcscpy_s(cmdCopy, cmdLine.size() + 1, cmdLine.c_str());
 
     // 6. Create Job Object (ensures child is killed if parent dies)
-    HANDLE hJob = CreateJobObjectW(NULL, NULL);
-    if (hJob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = { 0 };
-        jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
-                                &jobInfo, sizeof(jobInfo));
-    }
+    HANDLE hJob = createKillOnCloseJob();
 
     // 7. Launch the sandboxed process
     PROCESS_INFORMATION pi = {};
@@ -389,7 +398,7 @@ static int runWithSandboxApi(
         NULL,               // processAttributes (reserved)
         NULL,               // threadAttributes (reserved)
         FALSE,              // inheritHandles (must be FALSE)
-        0,                  // creationFlags
+        CREATE_SUSPENDED,   // resumed below, after the job assignment
         NULL,               // environment (inherit parent's)
         workingDir.c_str(),
         &si,
@@ -405,22 +414,34 @@ static int runWithSandboxApi(
         // API call failed — fall back to Restricted Token
         if (hJob) CloseHandle(hJob);
         FreeLibrary(hMod);
-        return -1;
+        return false;
     }
 
     FreeLibrary(hMod);
 
-    // 8. Associate with Job Object and wait for completion
-    if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
+    // 8. Assign to the job while the child is suspended so no grandchild can
+    // be spawned outside the job's kill-on-close protection, then resume.
+    // Both steps are best-effort: on failure the child only loses
+    // kill-on-parent-exit protection.
+    if (hJob && !AssignProcessToJobObject(hJob, pi.hProcess)) {
+        fwprintf(stderr, L"sandbox: job assignment failed (%lu)\n", GetLastError());
+    }
+    if (pi.hThread) ResumeThread(pi.hThread);
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
+    // On wait failure, still report the command as executed: re-running it
+    // via the fallback backend would double-execute the command.
+    DWORD exitCode = (DWORD)-1;
+    if (WaitForSingleObject(pi.hProcess, INFINITE) == WAIT_OBJECT_0) {
+        if (!GetExitCodeProcess(pi.hProcess, &exitCode)) {
+            exitCode = (DWORD)-1;
+        }
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     if (hJob) CloseHandle(hJob);
 
-    return (int)exitCode;
+    *exitCodeOut = (int)exitCode;
+    return true;
 }
 
 // ============================================================
@@ -438,6 +459,34 @@ static bool isSidActive(PCWSTR workspace, PSID sid);
 static void getLockFilePath(PCWSTR workspace, PSID sid, WCHAR* path, DWORD pathSize);
 static DWORD WINAPI LockUpdateThreadProc(LPVOID lpParameter);
 
+/**
+ * @brief Stop the heartbeat thread and roll back granted ACEs / lock files.
+ *
+ * Shared by every failure path after step 3 (ACL + lock setup) and by the
+ * normal-exit cleanup. Must run before the process exits: the heartbeat
+ * thread touches the lock files, so it is terminated first.
+ *
+ * @param hHeartbeatThread  Heartbeat thread handle (may be NULL)
+ * @param wWorkspaces       Workspace directories (wide)
+ * @param workspaceSid      Sandbox SID whose ACEs / lock files are removed
+ */
+static void cleanupWorkspaceGrants(
+    HANDLE hHeartbeatThread,
+    const std::vector<std::wstring>& wWorkspaces,
+    PSID workspaceSid
+) {
+    if (hHeartbeatThread) {
+        TerminateThread(hHeartbeatThread, 0);
+        CloseHandle(hHeartbeatThread);
+    }
+    if (CLEANUP_AFTER_EACH_COMMAND) {
+        for (const auto& ws : wWorkspaces) {
+            deleteLockFile(ws.c_str(), workspaceSid);
+            removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
+        }
+    }
+}
+
 // ============================================================
 //  Main entry: set up sandbox and launch command
 // ============================================================
@@ -450,9 +499,22 @@ int run(const Config& cfg) {
     for (const auto& ws : cfg.workspaces)
         wWorkspaces.push_back(utf8ToWide(ws));
 
-    // Ensure all workspace directories exist (create if missing)
-    for (const auto& ws : wWorkspaces)
+    // Ensure all workspace directories exist (create if missing) and normalize
+    // every path, so ACL, lock files, the child working directory and the
+    // sandbox API spec all reference the same directory. (Symlink/junction
+    // final-name resolution is deliberately not attempted here.)
+    for (auto& ws : wWorkspaces) {
         CreateDirectoryW(ws.c_str(), NULL);
+        DWORD required = GetFullPathNameW(ws.c_str(), 0, NULL, NULL);
+        if (required > 0) {
+            std::wstring full(required, L'\0');
+            DWORD written = GetFullPathNameW(ws.c_str(), required, &full[0], NULL);
+            if (written > 0 && written < required) {
+                full.resize(written);
+                ws = std::move(full);
+            }
+        }
+    }
 
     // --- Select command shell ---
     std::wstring shell = utf8ToWide(cfg.shell);
@@ -478,9 +540,12 @@ int run(const Config& cfg) {
     // --- Try modern Windows Sandbox API first (Windows 11 24H2+) ---
     // Falls back to Restricted Token on older Windows or if the API fails.
     {
-        int sandboxResult = runWithSandboxApi(cmdLine, wWorkspaces[0], wWorkspaces, cfg.readOnly);
-        if (sandboxResult >= 0) return sandboxResult;
-        // sandboxResult == -1: API unavailable or call failed, fall through
+        int sandboxExitCode = 0;
+        if (runWithSandboxApi(cmdLine, wWorkspaces[0], wWorkspaces, cfg.readOnly,
+                              &sandboxExitCode)) {
+            return sandboxExitCode;
+        }
+        // API unavailable or call failed — fall through to Restricted Token.
     }
 
     // ================================================================
@@ -495,23 +560,38 @@ int run(const Config& cfg) {
         return 1;
     }
 
-    // --- 2. Generate random workspace SID (skipped in read-only mode) ---
+    // --- 2. Generate random workspace SID ---
+    // Doubles as the token's only restricting SID (step 4). In read-only mode
+    // it is never granted any ACE, so every write via the restricted token is
+    // denied (matches Linux/macOS read-only semantics).
     PSID workspaceSid = NULL;
     HANDLE hHeartbeatThread = NULL;
     std::vector<std::pair<std::wstring, PSID>> wsList;
+    if (!generateRandomSid(&workspaceSid)) {
+        fwprintf(stderr, L"sandbox: SID generation failed\n");
+        CloseHandle(hToken);
+        return 1;
+    }
     if (!cfg.readOnly) {
-        if (!generateRandomSid(&workspaceSid)) {
-            fwprintf(stderr, L"sandbox: SID generation failed\n");
-            CloseHandle(hToken);
-            return 1;
-        }
-
         // --- 3. Grant write access on each workspace dir + create lock files ---
+        // Fail closed: without its ACE the workspace is unwritable and the
+        // command can never succeed — abort instead of running with a
+        // half-configured sandbox.
         for (const auto& ws : wWorkspaces) {
             if (!ensureWorkspaceWriteAcl(ws.c_str(), workspaceSid)) {
                 fwprintf(stderr, L"sandbox: ACL setup failed for %s\n", ws.c_str());
+                cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
+                LocalFree(workspaceSid);
+                CloseHandle(hToken);
+                return 1;
             }
-            createLockFile(ws.c_str(), workspaceSid);
+            if (!createLockFile(ws.c_str(), workspaceSid)) {
+                fwprintf(stderr, L"sandbox: cannot create lock file in %s\n", ws.c_str());
+                cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
+                LocalFree(workspaceSid);
+                CloseHandle(hToken);
+                return 1;
+            }
         }
 
         // --- 3.5 Start heartbeat thread for lock file maintenance ---
@@ -522,69 +602,36 @@ int run(const Config& cfg) {
     }
 
     // --- 4. Create Restricted Token ---
-    // Add Everyone SID as a restricting SID so that the token can only write
-    // to objects explicitly granting access to one of the restricting SIDs.
-    PSID everyoneSid = NULL, logonSid = NULL;
-    ConvertStringSidToSidW(L"S-1-1-0", &everyoneSid);
-    if (!cfg.readOnly) {
-        // Extract the logon SID from the current token (needed for restricting)
-        DWORD bufSize = 0;
-        GetTokenInformation(hToken, TokenGroups, NULL, 0, &bufSize);
-        PTOKEN_GROUPS groups = (PTOKEN_GROUPS)LocalAlloc(LPTR, bufSize);
-        if (groups && GetTokenInformation(hToken, TokenGroups, groups, bufSize, &bufSize)) {
-            for (DWORD i = 0; i < groups->GroupCount; i++) {
-                if (groups->Groups[i].Attributes & SE_GROUP_LOGON_ID) {
-                    DWORD len = GetLengthSid(groups->Groups[i].Sid);
-                    logonSid = (PSID)LocalAlloc(LPTR, len);
-                    if (logonSid) CopySid(len, logonSid, groups->Groups[i].Sid);
-                    break;
-                }
-            }
-        }
-        LocalFree(groups);
-    }
-
-    // Build the list of restricting SIDs for CreateRestrictedToken
-    SID_AND_ATTRIBUTES restrictingSids[3] = {};
-    DWORD numRestricting = 0;
-    if (everyoneSid)  { restrictingSids[numRestricting].Sid = everyoneSid; numRestricting++; }
-    if (!cfg.readOnly && logonSid)     { restrictingSids[numRestricting].Sid = logonSid;     numRestricting++; }
-    if (!cfg.readOnly && workspaceSid) { restrictingSids[numRestricting].Sid = workspaceSid; numRestricting++; }
+    // WRITE_RESTRICTED consults restricting SIDs only for write-type accesses;
+    // reads keep using the token's normal user SIDs. Restrict to the random
+    // workspace SID alone: a write then requires an ACE explicitly granting
+    // that SID, which only the workspace has. Previously Everyone and the
+    // logon SID were restricting SIDs too, letting the child write anywhere
+    // those SIDs had write access (e.g. ACL-less FAT/exFAT volumes, where
+    // Everyone is implicitly granted) — including --read-only mode, whose
+    // restricting set consisted of Everyone alone.
+    SID_AND_ATTRIBUTES restrictingSids[1] = {};
+    restrictingSids[0].Sid = workspaceSid;
 
     HANDLE hRestrictedToken = NULL;
     BOOL ok = CreateRestrictedToken(
         hToken,
         DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
         0, NULL,          0, NULL,
-        numRestricting, restrictingSids,
+        1, restrictingSids,
         &hRestrictedToken
     );
     CloseHandle(hToken);
-    LocalFree(everyoneSid);
-    LocalFree(logonSid);
 
     if (!ok) {
         fwprintf(stderr, L"sandbox: CreateRestrictedToken (%lu)\n", GetLastError());
-        if (!cfg.readOnly) {
-            if (hHeartbeatThread) { TerminateThread(hHeartbeatThread, 0); CloseHandle(hHeartbeatThread); }
-            for (const auto& ws : wWorkspaces) {
-                if (CLEANUP_AFTER_EACH_COMMAND) {
-                    deleteLockFile(ws.c_str(), workspaceSid);
-                    removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
-                }
-            }
-        }
+        if (!cfg.readOnly) cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
         LocalFree(workspaceSid);
         return 1;
     }
 
     // --- 5. Create Job Object (ensures child is killed if parent dies) ---
-    HANDLE hJob = CreateJobObjectW(NULL, NULL);
-    if (hJob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = { 0 };
-        jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jobInfo, sizeof(jobInfo));
-    }
+    HANDLE hJob = createKillOnCloseJob();
 
     // --- 6. Launch command with restricted token ---
     // Pass through stdin/stdout/stderr handles for transparent I/O
@@ -611,7 +658,7 @@ int run(const Config& cfg) {
         NULL, cmdCopy,
         NULL, NULL,
         TRUE,   // Inherit handles (needed for stdin/stdout/stderr passthrough)
-        0,      // No special creation flags
+        CREATE_SUSPENDED,  // resumed below, after the job assignment
         NULL,
         wWorkspaces[0].c_str(),  // Set working directory to first workspace
         &si, &pi
@@ -622,26 +669,27 @@ int run(const Config& cfg) {
         fwprintf(stderr, L"sandbox: CreateProcessAsUserW (%lu)\n", GetLastError());
         CloseHandle(hRestrictedToken);
         if (hJob) CloseHandle(hJob);
-        if (!cfg.readOnly) {
-            if (hHeartbeatThread) { TerminateThread(hHeartbeatThread, 0); CloseHandle(hHeartbeatThread); }
-            for (const auto& ws : wWorkspaces) {
-                if (CLEANUP_AFTER_EACH_COMMAND) {
-                    deleteLockFile(ws.c_str(), workspaceSid);
-                    removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
-                }
-            }
-        }
+        if (!cfg.readOnly) cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
         LocalFree(workspaceSid);
         return 1;
     }
 
-    // Associate child process with the job object (auto-kill on parent exit)
-    if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
+    // Assign the child to the job while it is suspended so no grandchild can
+    // be spawned outside the job's kill-on-close protection, then resume.
+    // Best-effort: on failure the child only loses kill-on-parent-exit
+    // protection.
+    if (hJob && !AssignProcessToJobObject(hJob, pi.hProcess)) {
+        fwprintf(stderr, L"sandbox: job assignment failed (%lu)\n", GetLastError());
+    }
+    if (pi.hThread) ResumeThread(pi.hThread);
 
     // Wait for the child process to finish
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
+    DWORD exitCode = (DWORD)-1;
+    if (WaitForSingleObject(pi.hProcess, INFINITE) == WAIT_OBJECT_0) {
+        if (!GetExitCodeProcess(pi.hProcess, &exitCode)) {
+            exitCode = (DWORD)-1;
+        }
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
@@ -650,17 +698,7 @@ int run(const Config& cfg) {
 
     // --- 8. Stop heartbeat thread and clean up ACEs / lock files ---
     if (!cfg.readOnly) {
-        if (hHeartbeatThread) {
-            TerminateThread(hHeartbeatThread, 0);
-            CloseHandle(hHeartbeatThread);
-        }
-
-        if (CLEANUP_AFTER_EACH_COMMAND) {
-            for (const auto& ws : wWorkspaces) {
-                deleteLockFile(ws.c_str(), workspaceSid);
-                removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
-            }
-        }
+        cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
     }
 
     LocalFree(workspaceSid);
@@ -1009,8 +1047,10 @@ bool removeWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
         NULL, NULL, &dacl, NULL, &sd);
     if (err != ERROR_SUCCESS || !dacl) { LocalFree(sd); return false; }
 
-    // Count ACEs that are NOT owned by the target SID (to keep)
-    DWORD keepCount = 0;
+    // Size the new DACL from the real ACE sizes. A per-ACE estimate is always
+    // too small (real ACEs carry their SID; sizeof(ACCESS_ALLOWED_ACE) does
+    // not) and would produce a truncated DACL whose AddAce calls fail.
+    DWORD keepCount = 0, keepSize = sizeof(ACL);
     for (DWORD i = 0; i < dacl->AceCount; i++) {
         ACE_HEADER* ace = NULL;
         if (!GetAce(dacl, i, (void**)&ace)) continue;
@@ -1019,16 +1059,20 @@ bool removeWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
             aceSid = (PSID)&((ACCESS_ALLOWED_ACE*)ace)->SidStart;
         else if (ace->AceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE)
             aceSid = (PSID)&((ACCESS_ALLOWED_CALLBACK_ACE*)ace)->SidStart;
-        else { keepCount++; continue; }
-        if (!EqualSid(aceSid, sid)) keepCount++;
+        else { keepCount++; keepSize += ace->AceSize; continue; }
+        if (!EqualSid(aceSid, sid)) { keepCount++; keepSize += ace->AceSize; }
     }
 
     // Rebuild DACL without the target SID's ACEs
-    DWORD newSize = sizeof(ACL) + keepCount * sizeof(ACCESS_ALLOWED_ACE);
-    PACL newDacl = (PACL)LocalAlloc(LPTR, newSize);
+    PACL newDacl = (PACL)LocalAlloc(LPTR, keepSize);
     if (!newDacl) { LocalFree(sd); return false; }
-    InitializeAcl(newDacl, newSize, ACL_REVISION);
+    if (!InitializeAcl(newDacl, keepSize, ACL_REVISION)) {
+        LocalFree(newDacl);
+        LocalFree(sd);
+        return false;
+    }
 
+    BOOL aclComplete = TRUE;
     for (DWORD i = 0; i < dacl->AceCount; i++) {
         ACE_HEADER* ace = NULL;
         if (!GetAce(dacl, i, (void**)&ace)) continue;
@@ -1037,16 +1081,24 @@ bool removeWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
             aceSid = (PSID)&((ACCESS_ALLOWED_ACE*)ace)->SidStart;
         else if (ace->AceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE)
             aceSid = (PSID)&((ACCESS_ALLOWED_CALLBACK_ACE*)ace)->SidStart;
-        else { AddAce(newDacl, ACL_REVISION, MAXDWORD, ace, ace->AceSize); continue; }
-        // Keep all ACEs except those matching the target SID
-        if (!EqualSid(aceSid, sid))
-            AddAce(newDacl, ACL_REVISION, MAXDWORD, ace, ace->AceSize);
+        if (aceSid && EqualSid(aceSid, sid)) continue;
+        // Never write back a partially built DACL: a failed AddAce would
+        // silently drop the remaining ACEs (e.g. the user's own access)
+        // from the directory.
+        if (!AddAce(newDacl, ACL_REVISION, MAXDWORD, ace, ace->AceSize)) {
+            aclComplete = FALSE;
+            break;
+        }
     }
 
-    err = SetNamedSecurityInfoW(
-        (LPWSTR)workspace, SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        NULL, NULL, newDacl, NULL);
+    if (aclComplete) {
+        err = SetNamedSecurityInfoW(
+            (LPWSTR)workspace, SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            NULL, NULL, newDacl, NULL);
+    } else {
+        err = ERROR_INVALID_ACL;
+    }
     LocalFree(newDacl);
     LocalFree(sd);
     return err == ERROR_SUCCESS;

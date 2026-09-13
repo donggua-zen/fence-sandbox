@@ -25,6 +25,13 @@
 - build_project.bat 自动探测 Visual Studio 路径
 
 ### Fixed
+- Linux: Landlock `WRITE_ACCESS_MASK` 未 handle `REMOVE_DIR`，工作目录外空目录可被 `rmdir` 删除（所有 Linux 构建受影响）；补上该权限位并新增 rmdir 回归用例
+- Linux: 无 `<linux/landlock.h>` 时的 fallback 常量与内核 UAPI 位值错位（REMOVE_FILE 从 bit2 起），按官方位序修正（v5.13/v6.2/master 三处核对一致）；`packed` 与内核 UAPI 相同属正确写法，保留；ABI < 3 内核增加 truncate 缺口警告
+- Windows: AppContainer 后端用 `-1` 兼作"回落"哨兵与子进程退出码，退出码 ≥ 0x80000000 的命令（如 `exit -1`）会被 Restricted Token 后端重复执行——退出码改由出参传递
+- Windows: restricting SID 去掉 Everyone/logon SID，仅保留随机 workspace SID；`--read-only` 模式下该 SID 不授予任何 ACE，修复无 ACL 卷（FAT/exFAT）上写保护与只读模式失效
+- Windows: `removeWorkspaceWriteAcl` 按 `sizeof(ACCESS_ALLOWED_ACE)` 估算重建 DACL 缓冲（真实 ACE 更大，必然不足）且 `AddAce` 失败不检查，残缺 DACL 被写回目录——改为按实际 `AceSize` 累加，构建失败不写回；ACL/lock 建立失败时中止运行（fail-closed）
+- Windows: 工作目录经 `GetFullPathNameW` 规范化后统一使用；子进程改为挂起创建、挂入 Job Object 后再恢复（消除孙进程逃逸窗口）；删除每次运行向 stderr 打印的 SandboxSpec 调试转储
+- CI: 恢复 Windows cmd-only 测试（`SANDBOX_TEST_SKIP_DEFAULT_SHELL` 跳过默认 powershell 用例），Restricted Token 后端重新获得回归保护
 - Windows: ACL 未授予 DELETE 权限，导致工作目录内无法删除文件（`GENERIC_WRITE` 不包含 `DELETE`）
 - Linux: 子进程未 `chdir()` 到工作目录，导致相对路径命令在工作目录外执行（Windows 通过 `CreateProcessAsUserW` 的 `lpCurrentDirectory` 正确设置，Linux 缺失）
 

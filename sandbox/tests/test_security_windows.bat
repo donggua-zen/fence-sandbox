@@ -1,7 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
 
-set "SANDBOX=D:\AI\sandbox\build\bin\sandbox.exe"
+:: Path to the sandbox binary: %1 overrides the local default.
+set "SANDBOX=%~1"
+if not defined SANDBOX set "SANDBOX=D:\AI\sandbox\build\bin\sandbox.exe"
+if not exist "%SANDBOX%" (
+    echo sandbox binary not found: "%SANDBOX%"
+    exit /b 2
+)
 set "PASS=0"
 set "FAIL=0"
 
@@ -88,6 +94,11 @@ echo old > "%WS%\overwrite.txt"
 findstr "new" "%WS%\overwrite.txt" >nul 2>nul
 if !ERRORLEVEL! EQU 0 ( echo [PASS] & set /a PASS+=1 ) else ( echo [FAIL] & set /a FAIL+=1 )
 
+:: Default-shell (powershell) cases hang on some environments (GitHub
+:: runners): the write-restricted token blocks powershell startup. CI sets
+:: SANDBOX_TEST_SKIP_DEFAULT_SHELL to run the cmd-only subset.
+if defined SANDBOX_TEST_SKIP_DEFAULT_SHELL goto summary
+
 echo --- Test 16: Default shell (PowerShell) - write inside workspace (ALLOW) ---
 "%SANDBOX%" -c "echo test > ps.txt" --workspace "%WS%" 2>nul
 if exist "%WS%\ps.txt" ( echo [PASS] & set /a PASS+=1 ) else ( echo [FAIL] & set /a FAIL+=1 )
@@ -104,6 +115,7 @@ echo --- Test 19: Default shell (PowerShell) - exit code passthrough (expect 42)
 "%SANDBOX%" -c "exit 42" --workspace "%WS%" 2>nul
 if !ERRORLEVEL! EQU 42 ( echo [PASS] & set /a PASS+=1 ) else ( echo [FAIL] got !ERRORLEVEL! & set /a FAIL+=1 )
 
+:summary
 echo.
 echo ============================================
 echo  Results: !PASS! passed, !FAIL! failed
