@@ -335,19 +335,6 @@ static bool runWithSandboxApi(
         return false;
     }
 
-    // 2.5 Diagnostic: hex dump first 64 bytes of spec to stderr
-    // (temporary for debugging, can be removed later)
-    {
-        fwprintf(stderr, L"sandbox: [diagnostic] SandboxSpec size=%zu bytes, hex:\n",
-                 specBuf.size());
-        for (size_t i = 0; i < specBuf.size(); i += 16) {
-            fwprintf(stderr, L"  %04zu: ", i);
-            for (size_t j = 0; j < 16 && i + j < specBuf.size(); j++)
-                fwprintf(stderr, L"%02X ", specBuf[i + j]);
-            fwprintf(stderr, L"\n");
-        }
-    }
-
     // 3. Use a stable identity (AppContainer profile is persistent, not ephemeral)
     //    Then ensure the profile is registered via CreateAppContainerProfile.
     static const WCHAR kIdentity[] = L"AISandbox.Container.v1";
@@ -381,13 +368,7 @@ static bool runWithSandboxApi(
     wcscpy_s(cmdCopy, cmdLine.size() + 1, cmdLine.c_str());
 
     // 6. Create Job Object (ensures child is killed if parent dies)
-    HANDLE hJob = CreateJobObjectW(NULL, NULL);
-    if (hJob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = { 0 };
-        jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
-                                &jobInfo, sizeof(jobInfo));
-    }
+    HANDLE hJob = createKillOnCloseJob();
 
     // 7. Launch the sandboxed process
     PROCESS_INFORMATION pi = {};
@@ -397,7 +378,7 @@ static bool runWithSandboxApi(
         NULL,               // processAttributes (reserved)
         NULL,               // threadAttributes (reserved)
         FALSE,              // inheritHandles (must be FALSE)
-        0,                  // creationFlags
+        CREATE_SUSPENDED,   // resumed below, after the job assignment
         NULL,               // environment (inherit parent's)
         workingDir.c_str(),
         &si,
@@ -418,13 +399,17 @@ static bool runWithSandboxApi(
 
     FreeLibrary(hMod);
 
-    // 8. Associate with Job Object and wait for completion.
+    // 8. Assign to the job while the child is suspended so no grandchild can
+    // be spawned outside the job's kill-on-close protection, then resume.
+    // Both steps are best-effort: on failure the child only loses
+    // kill-on-parent-exit protection.
+    if (hJob && !AssignProcessToJobObject(hJob, pi.hProcess)) {
+        fwprintf(stderr, L"sandbox: job assignment failed (%lu)\n", GetLastError());
+    }
+    if (pi.hThread) ResumeThread(pi.hThread);
+
     // On wait failure, still report the command as executed: re-running it
     // via the fallback backend would double-execute the command.
-    // Job assignment is best-effort: on failure the child only loses
-    // kill-on-parent-exit protection.
-    if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
-
     DWORD exitCode = (DWORD)-1;
     if (WaitForSingleObject(pi.hProcess, INFINITE) == WAIT_OBJECT_0) {
         if (!GetExitCodeProcess(pi.hProcess, &exitCode)) {
@@ -482,6 +467,26 @@ static void cleanupWorkspaceGrants(
     }
 }
 
+/**
+ * @brief Create a Job Object with KILL_ON_JOB_CLOSE so the sandboxed child
+ *        and its descendants die when the launcher exits.
+ *
+ * @return Job handle, or NULL on failure (protection is best-effort)
+ */
+static HANDLE createKillOnCloseJob() {
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (!hJob) return NULL;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = { 0 };
+    jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                 &jobInfo, sizeof(jobInfo))) {
+        fwprintf(stderr, L"sandbox: job object setup failed (%lu)\n", GetLastError());
+        CloseHandle(hJob);
+        return NULL;
+    }
+    return hJob;
+}
+
 // ============================================================
 //  Main entry: set up sandbox and launch command
 // ============================================================
@@ -494,9 +499,22 @@ int run(const Config& cfg) {
     for (const auto& ws : cfg.workspaces)
         wWorkspaces.push_back(utf8ToWide(ws));
 
-    // Ensure all workspace directories exist (create if missing)
-    for (const auto& ws : wWorkspaces)
+    // Ensure all workspace directories exist (create if missing) and normalize
+    // every path, so ACL, lock files, the child working directory and the
+    // sandbox API spec all reference the same directory. (Symlink/junction
+    // final-name resolution is deliberately not attempted here.)
+    for (auto& ws : wWorkspaces) {
         CreateDirectoryW(ws.c_str(), NULL);
+        DWORD required = GetFullPathNameW(ws.c_str(), 0, NULL, NULL);
+        if (required > 0) {
+            std::wstring full(required, L'\0');
+            DWORD written = GetFullPathNameW(ws.c_str(), required, &full[0], NULL);
+            if (written > 0 && written < required) {
+                full.resize(written);
+                ws = std::move(full);
+            }
+        }
+    }
 
     // --- Select command shell ---
     std::wstring shell = utf8ToWide(cfg.shell);
@@ -613,12 +631,7 @@ int run(const Config& cfg) {
     }
 
     // --- 5. Create Job Object (ensures child is killed if parent dies) ---
-    HANDLE hJob = CreateJobObjectW(NULL, NULL);
-    if (hJob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo = { 0 };
-        jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jobInfo, sizeof(jobInfo));
-    }
+    HANDLE hJob = createKillOnCloseJob();
 
     // --- 6. Launch command with restricted token ---
     // Pass through stdin/stdout/stderr handles for transparent I/O
@@ -645,7 +658,7 @@ int run(const Config& cfg) {
         NULL, cmdCopy,
         NULL, NULL,
         TRUE,   // Inherit handles (needed for stdin/stdout/stderr passthrough)
-        0,      // No special creation flags
+        CREATE_SUSPENDED,  // resumed below, after the job assignment
         NULL,
         wWorkspaces[0].c_str(),  // Set working directory to first workspace
         &si, &pi
@@ -661,8 +674,14 @@ int run(const Config& cfg) {
         return 1;
     }
 
-    // Associate child process with the job object (auto-kill on parent exit)
-    if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
+    // Assign the child to the job while it is suspended so no grandchild can
+    // be spawned outside the job's kill-on-close protection, then resume.
+    // Best-effort: on failure the child only loses kill-on-parent-exit
+    // protection.
+    if (hJob && !AssignProcessToJobObject(hJob, pi.hProcess)) {
+        fwprintf(stderr, L"sandbox: job assignment failed (%lu)\n", GetLastError());
+    }
+    if (pi.hThread) ResumeThread(pi.hThread);
 
     // Wait for the child process to finish
     DWORD exitCode = (DWORD)-1;
