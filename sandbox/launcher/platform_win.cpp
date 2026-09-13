@@ -284,31 +284,39 @@ typedef BOOL (WINAPI *PFN_Experimental_CreateProcessInSandbox)(
  * @brief Try running the command via Experimental_CreateProcessInSandbox.
  *
  * Probes for processmodel.dll and the experimental API. If unavailable or
- * the call fails, returns -1 to signal the caller to fall back to the
+ * the call fails, returns false to signal the caller to fall back to the
  * Restricted Token approach.
+ *
+ * The exit code is reported through an out parameter — it must never share
+ * a channel with the "should fall back" signal: child processes legitimately
+ * exit with 0xFFFFFFFF (-1), which would otherwise trigger a second run of
+ * the same command via the fallback backend.
  *
  * @param cmdLine    Full command line (shell + args + user command)
  * @param workingDir Working directory for the child process
  * @param wWorkspaces Workspace directories (for fs_read_write / fs_read_only)
  * @param readOnly   If true, workspaces are read-only
- * @return Exit code (>= 0) on success, or -1 to signal fallback
+ * @param exitCodeOut Receives the child's exit code when true is returned
+ * @return true if the command was executed via the sandbox API, false if the
+ *         caller should fall back
  */
-static int runWithSandboxApi(
+static bool runWithSandboxApi(
     const std::wstring& cmdLine,
     const std::wstring& workingDir,
     const std::vector<std::wstring>& wWorkspaces,
-    bool readOnly
+    bool readOnly,
+    int* exitCodeOut
 ) {
     // 1. Load processmodel.dll from System32
     HMODULE hMod = LoadLibraryExW(L"processmodel.dll", NULL,
                                   LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!hMod) return -1;
+    if (!hMod) return false;
 
     auto pfnCreate = (PFN_Experimental_CreateProcessInSandbox)
         GetProcAddress(hMod, "Experimental_CreateProcessInSandbox");
     if (!pfnCreate) {
         FreeLibrary(hMod);
-        return -1;
+        return false;
     }
 
     // 2. Build the FlatBuffer SandboxSpec
@@ -324,7 +332,7 @@ static int runWithSandboxApi(
     std::vector<uint8_t> specBuf;
     if (!buildSandboxSpec(rwPaths, roPaths, specBuf)) {
         FreeLibrary(hMod);
-        return -1;
+        return false;
     }
 
     // 2.5 Diagnostic: hex dump first 64 bytes of spec to stderr
@@ -346,7 +354,7 @@ static int runWithSandboxApi(
     if (!ensureAppContainerProfile(kIdentity)) {
         // profile registration failed → API won't accept the identity, fall back
         FreeLibrary(hMod);
-        return -1;
+        return false;
     }
 
     // 4. Set up STARTUPINFO with stdio handle passthrough
@@ -369,7 +377,7 @@ static int runWithSandboxApi(
     // 5. Build mutable command line buffer
     WCHAR* cmdCopy = (WCHAR*)LocalAlloc(LPTR,
         (cmdLine.size() + 1) * sizeof(WCHAR));
-    if (!cmdCopy) { FreeLibrary(hMod); return -1; }
+    if (!cmdCopy) { FreeLibrary(hMod); return false; }
     wcscpy_s(cmdCopy, cmdLine.size() + 1, cmdLine.c_str());
 
     // 6. Create Job Object (ensures child is killed if parent dies)
@@ -405,22 +413,30 @@ static int runWithSandboxApi(
         // API call failed — fall back to Restricted Token
         if (hJob) CloseHandle(hJob);
         FreeLibrary(hMod);
-        return -1;
+        return false;
     }
 
     FreeLibrary(hMod);
 
-    // 8. Associate with Job Object and wait for completion
+    // 8. Associate with Job Object and wait for completion.
+    // On wait failure, still report the command as executed: re-running it
+    // via the fallback backend would double-execute the command.
+    // Job assignment is best-effort: on failure the child only loses
+    // kill-on-parent-exit protection.
     if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
+    DWORD exitCode = (DWORD)-1;
+    if (WaitForSingleObject(pi.hProcess, INFINITE) == WAIT_OBJECT_0) {
+        if (!GetExitCodeProcess(pi.hProcess, &exitCode)) {
+            exitCode = (DWORD)-1;
+        }
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     if (hJob) CloseHandle(hJob);
 
-    return (int)exitCode;
+    *exitCodeOut = (int)exitCode;
+    return true;
 }
 
 // ============================================================
@@ -478,9 +494,12 @@ int run(const Config& cfg) {
     // --- Try modern Windows Sandbox API first (Windows 11 24H2+) ---
     // Falls back to Restricted Token on older Windows or if the API fails.
     {
-        int sandboxResult = runWithSandboxApi(cmdLine, wWorkspaces[0], wWorkspaces, cfg.readOnly);
-        if (sandboxResult >= 0) return sandboxResult;
-        // sandboxResult == -1: API unavailable or call failed, fall through
+        int sandboxExitCode = 0;
+        if (runWithSandboxApi(cmdLine, wWorkspaces[0], wWorkspaces, cfg.readOnly,
+                              &sandboxExitCode)) {
+            return sandboxExitCode;
+        }
+        // API unavailable or call failed — fall through to Restricted Token.
     }
 
     // ================================================================
@@ -639,9 +658,12 @@ int run(const Config& cfg) {
     if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
 
     // Wait for the child process to finish
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
+    DWORD exitCode = (DWORD)-1;
+    if (WaitForSingleObject(pi.hProcess, INFINITE) == WAIT_OBJECT_0) {
+        if (!GetExitCodeProcess(pi.hProcess, &exitCode)) {
+            exitCode = (DWORD)-1;
+        }
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
