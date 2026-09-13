@@ -32,6 +32,9 @@
 - Windows: `removeWorkspaceWriteAcl` 按 `sizeof(ACCESS_ALLOWED_ACE)` 估算重建 DACL 缓冲（真实 ACE 更大，必然不足）且 `AddAce` 失败不检查，残缺 DACL 被写回目录——改为按实际 `AceSize` 累加，构建失败不写回；ACL/lock 建立失败时中止运行（fail-closed）
 - Windows: 工作目录经 `GetFullPathNameW` 规范化后统一使用；子进程改为挂起创建、挂入 Job Object 后再恢复（消除孙进程逃逸窗口）；删除每次运行向 stderr 打印的 SandboxSpec 调试转储
 - CI: 恢复 Windows cmd-only 测试（`SANDBOX_TEST_SKIP_DEFAULT_SHELL` 跳过默认 powershell 用例），Restricted Token 后端重新获得回归保护
+
+### Known issues
+- Windows: `WRITE_RESTRICTED` 令牌的 restricting SID 检查只覆盖 `GENERIC_WRITE` 映射的访问，不含 `DELETE`——**工作目录外文件的删除在 Restricted Token 后端上目前不会被拦截**。本次接入 CI 的安全用例首次暴露此问题，属存量模型缺口（修改前 Everyone/logon 在 restricting 集合时同样可删），与本次修复无关。CI 暂以 `SANDBOX_TEST_SKIP_DELETE_OUTSIDE` 跳过该用例；可行的修复方向：ACL 显式授权（授予"仅 workspace SID 可删"并依赖继承，参见 OpenAI Codex Windows 沙盒的做法）或以默认拒绝的 AppContainer 后端为主（Win11 24H2+）
 - Windows: ACL 未授予 DELETE 权限，导致工作目录内无法删除文件（`GENERIC_WRITE` 不包含 `DELETE`）
 - Linux: 子进程未 `chdir()` 到工作目录，导致相对路径命令在工作目录外执行（Windows 通过 `CreateProcessAsUserW` 的 `lpCurrentDirectory` 正确设置，Linux 缺失）
 

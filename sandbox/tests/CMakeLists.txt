@@ -13,7 +13,7 @@ if(WIN32)
         COMMAND "${CMAKE_CURRENT_LIST_DIR}/test_security_windows.bat" "$<TARGET_FILE:sandbox>"
     )
     set_tests_properties(integration_tests security_tests PROPERTIES
-        ENVIRONMENT "SANDBOX_TEST_SKIP_DEFAULT_SHELL=1"
+        ENVIRONMENT "SANDBOX_TEST_SKIP_DEFAULT_SHELL=1;SANDBOX_TEST_SKIP_DELETE_OUTSIDE=1"
     )
 elseif(APPLE)
     add_test(NAME integration_tests

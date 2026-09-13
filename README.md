@@ -190,6 +190,7 @@ proc.on('exit', (code) => {
 
 - Windows: 命令默认通过 `powershell.exe -NoProfile -NonInteractive -Command` 执行，可用 `--shell cmd` 切换为 `cmd.exe /c`；Linux: 命令默认通过 `sh -c` 执行，可用 `--shell bash` 切换为 `bash -c`；macOS: 命令默认通过 `sh -c` 执行，可用 `--shell bash`/`--shell zsh` 切换，经 `/usr/bin/sandbox-exec` 应用 Seatbelt 沙箱
 - Windows: 受限令牌启动的 `powershell.exe` 在部分环境（如 GitHub Windows runner）会阻塞，CI 通过 `SANDBOX_TEST_SKIP_DEFAULT_SHELL` 跳过默认 shell 用例；Win11 24H2+ Sandbox API（AppContainer）路径仍待真机验证
+- Windows（已知限制）: `WRITE_RESTRICTED` 不覆盖 `DELETE` 权限，Restricted Token 后端目前**无法拦截工作目录外的文件删除**；Linux（Landlock）与 macOS（Seatbelt）不受影响。详见 CHANGELOG "Known issues"
 - 工作目录路径不存在时会自动创建
 - Windows: `.sandbox/` 目录用于存放 lock 文件（隐藏属性），请勿手动删除
 - Linux: 无额外文件，无残留
