@@ -15,6 +15,16 @@ set "OUTSIDE=%TEMP%\sandbox_test_outside_%RANDOM%"
 mkdir "%WS%" 2>nul
 mkdir "%OUTSIDE%" 2>nul
 
+echo ============================================
+echo  AI Sandbox - Windows Integration Tests
+echo ============================================
+echo.
+
+:: Default-shell (powershell) cases hang on some environments (GitHub
+:: runners): the write-restricted token blocks powershell startup. CI sets
+:: SANDBOX_TEST_SKIP_DEFAULT_SHELL to run the cmd-only subset.
+if defined SANDBOX_TEST_SKIP_DEFAULT_SHELL goto cmd_shell_tests
+
 echo === Test 1: Default shell (PowerShell) - write inside workspace (should succeed) ===
 "%SANDBOX%" -c "echo hello > test.txt" --workspace "%WS%"
 if !ERRORLEVEL! EQU 0 (
@@ -56,6 +66,7 @@ if !ERRORLEVEL! EQU 42 (
     set "EXIT_CODE=1"
 )
 
+:cmd_shell_tests
 echo === Test 5: --shell cmd - write inside workspace (should succeed) ===
 "%SANDBOX%" --shell cmd -c "echo hello > cmd_test.txt" --workspace "%WS%"
 if !ERRORLEVEL! EQU 0 (
