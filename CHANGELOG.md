@@ -6,6 +6,9 @@
 
 ## [Unreleased]
 
+### Changed
+- CI: Windows 平台跳过测试步骤，仅验证构建——默认 shell 为 powershell（`4c12a93`）时，受限令牌启动的 `powershell.exe` 在 GitHub runner 上无限阻塞导致 ctest 挂起；测试保留在 Linux/macOS CI 与本地 Windows 运行，所有 job 增加 15 分钟超时保护
+
 ### Added
 - Apache-2.0 开源协议
 - CI 自动化：GitHub Actions 三平台（Windows/Linux/macOS）构建+测试+打包，打 `v*` tag 自动发布 Release 附件
