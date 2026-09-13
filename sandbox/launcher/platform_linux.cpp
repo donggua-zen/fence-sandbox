@@ -59,36 +59,41 @@
 
 #ifndef LANDLOCK_ACCESS_FS_EXECUTE
 /// Fallback Landlock definitions when kernel header is absent.
+/// Bit positions are frozen kernel UAPI (include/uapi/linux/landlock.h,
+/// unchanged since ABI v1 in Linux 5.13) — never renumber.
 struct landlock_ruleset_attr {
     uint64_t handled_access_fs;
 };
 struct landlock_path_beneath_attr {
     uint64_t allowed_access;
     int32_t  parent_fd;
-} __attribute__((packed));
+} __attribute__((packed));  // kernel UAPI is packed too (12 bytes, no tail padding)
 
 #define LANDLOCK_CREATE_RULESET_VERSION 1
 #define LANDLOCK_RULE_PATH_BENEATH      1
 
 #define LANDLOCK_ACCESS_FS_EXECUTE       (1ULL << 0)
 #define LANDLOCK_ACCESS_FS_WRITE_FILE    (1ULL << 1)
-#define LANDLOCK_ACCESS_FS_REMOVE_FILE   (1ULL << 2)
-#define LANDLOCK_ACCESS_FS_MAKE_CHAR     (1ULL << 3)
-#define LANDLOCK_ACCESS_FS_MAKE_DIR      (1ULL << 4)
-#define LANDLOCK_ACCESS_FS_MAKE_REG      (1ULL << 5)
-#define LANDLOCK_ACCESS_FS_MAKE_SOCK     (1ULL << 6)
-#define LANDLOCK_ACCESS_FS_MAKE_FIFO     (1ULL << 7)
-#define LANDLOCK_ACCESS_FS_MAKE_BLOCK    (1ULL << 8)
-#define LANDLOCK_ACCESS_FS_MAKE_SYM      (1ULL << 9)
+#define LANDLOCK_ACCESS_FS_READ_FILE     (1ULL << 2)
+#define LANDLOCK_ACCESS_FS_READ_DIR      (1ULL << 3)
+#define LANDLOCK_ACCESS_FS_REMOVE_DIR    (1ULL << 4)
+#define LANDLOCK_ACCESS_FS_REMOVE_FILE   (1ULL << 5)
+#define LANDLOCK_ACCESS_FS_MAKE_CHAR     (1ULL << 6)
+#define LANDLOCK_ACCESS_FS_MAKE_DIR      (1ULL << 7)
+#define LANDLOCK_ACCESS_FS_MAKE_REG      (1ULL << 8)
+#define LANDLOCK_ACCESS_FS_MAKE_SOCK     (1ULL << 9)
+#define LANDLOCK_ACCESS_FS_MAKE_FIFO     (1ULL << 10)
+#define LANDLOCK_ACCESS_FS_MAKE_BLOCK    (1ULL << 11)
+#define LANDLOCK_ACCESS_FS_MAKE_SYM      (1ULL << 12)
 #endif
 
 /// ABI v2: refer (linking/removing) support, kernel 5.19+
 #ifndef LANDLOCK_ACCESS_FS_REFER
-#define LANDLOCK_ACCESS_FS_REFER         (1ULL << 11)
+#define LANDLOCK_ACCESS_FS_REFER         (1ULL << 13)
 #endif
 /// ABI v3: truncate support, kernel 6.2+
 #ifndef LANDLOCK_ACCESS_FS_TRUNCATE
-#define LANDLOCK_ACCESS_FS_TRUNCATE      (1ULL << 12)
+#define LANDLOCK_ACCESS_FS_TRUNCATE      (1ULL << 14)
 #endif
 
 /// Syscall numbers (generic syscall table, same across architectures).
@@ -103,8 +108,10 @@ struct landlock_path_beneath_attr {
 #endif
 
 /// All write-related access flags from ABI v1 (the baseline).
+/// READ_FILE / READ_DIR must stay out: reads are always allowed.
 #define WRITE_ACCESS_MASK ( \
     LANDLOCK_ACCESS_FS_WRITE_FILE  | \
+    LANDLOCK_ACCESS_FS_REMOVE_DIR  | \
     LANDLOCK_ACCESS_FS_REMOVE_FILE | \
     LANDLOCK_ACCESS_FS_MAKE_CHAR   | \
     LANDLOCK_ACCESS_FS_MAKE_DIR    | \
@@ -178,6 +185,13 @@ int run(const Config& cfg) {
     }
     if (abi >= 3) {
         access_mask |= LANDLOCK_ACCESS_FS_TRUNCATE;   // kernel 6.2+
+    }
+    if (abi < 3) {
+        // Without TRUNCATE handling, open(path, O_RDONLY | O_TRUNC) bypasses
+        // the write restriction on kernels older than 6.2 — tell the user.
+        fprintf(stderr, "sandbox: warning: kernel Landlock ABI %d lacks truncate "
+                        "protection; O_TRUNC-style writes outside the workspace "
+                        "are not blocked\n", abi);
     }
 
     // --- 3. Create Landlock ruleset ---

@@ -76,6 +76,17 @@ else
     EXIT_CODE=1
 fi
 
+echo "=== Test 7: rmdir outside workspace (should fail) ==="
+mkdir "$OUTSIDE/emptydir"
+"$SANDBOX" -c "rmdir $OUTSIDE/emptydir" --workspace "$WS"
+rc=$?
+if [ $rc -ne 0 ] && [ -d "$OUTSIDE/emptydir" ]; then
+    echo "[PASS] rmdir outside workspace denied"
+else
+    echo "[FAIL] rmdir outside workspace - should have been denied (rc=$rc)"
+    EXIT_CODE=1
+fi
+
 # Cleanup
 rm -rf "$WS" "$OUTSIDE"
 

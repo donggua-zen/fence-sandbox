@@ -89,6 +89,11 @@ echo test > "$WS/intra_move.txt"
 "$SANDBOX" -c "mv $WS/intra_move.txt $WS/intra_moved.txt" --workspace "$WS" 2>/dev/null
 if [ -f "$WS/intra_moved.txt" ]; then echo "[PASS]"; PASS=$((PASS+1)); else echo "[FAIL]"; FAIL=$((FAIL+1)); fi
 
+echo "--- Test 17: Remove directory outside workspace (DENY) ---"
+mkdir "$OUTSIDE/emptydir"
+"$SANDBOX" -c "rmdir $OUTSIDE/emptydir" --workspace "$WS" 2>/dev/null
+if [ -d "$OUTSIDE/emptydir" ]; then echo "[PASS]"; PASS=$((PASS+1)); else echo "[FAIL]"; FAIL=$((FAIL+1)); fi
+
 echo ""
 echo "============================================"
 echo " Results: $PASS passed, $FAIL failed"
