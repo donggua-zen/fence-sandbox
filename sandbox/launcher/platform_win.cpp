@@ -9,7 +9,8 @@
 //   declarative filesystem rules via FlatBuffer SandboxSpec. Zero ACL footprint.
 //
 // Fallback backend (all Windows versions):
-//   Restricted Token + ACL — Generate a random SID, grant it GENERIC_WRITE on
+//   Restricted Token + ACL — Generate a random SID, grant it the workspace
+//   grant mask (write + execute + delete, no DACL/owner tampering) on
 //   workspace directories, create a WRITE_RESTRICTED token, launch the process.
 //   Cleanup removes the ACE and lock file on completion.
 //
@@ -539,9 +540,15 @@ int run(const Config& cfg) {
 
     // --- Try modern Windows Sandbox API first (Windows 11 24H2+) ---
     // Falls back to Restricted Token on older Windows or if the API fails.
+    // SANDBOX_FORCE_RESTRICTED_TOKEN=1 skips the Sandbox API attempt so the
+    // fallback backend can be exercised and tested on 24H2+ machines.
     {
+        wchar_t forceRt[8];
+        bool forceRestrictedToken =
+            GetEnvironmentVariableW(L"SANDBOX_FORCE_RESTRICTED_TOKEN", forceRt, 8) > 0;
         int sandboxExitCode = 0;
-        if (runWithSandboxApi(cmdLine, wWorkspaces[0], wWorkspaces, cfg.readOnly,
+        if (!forceRestrictedToken &&
+            runWithSandboxApi(cmdLine, wWorkspaces[0], wWorkspaces, cfg.readOnly,
                               &sandboxExitCode)) {
             return sandboxExitCode;
         }
@@ -603,25 +610,84 @@ int run(const Config& cfg) {
 
     // --- 4. Create Restricted Token ---
     // WRITE_RESTRICTED consults restricting SIDs only for write-type accesses;
-    // reads keep using the token's normal user SIDs. Restrict to the random
-    // workspace SID alone: a write then requires an ACE explicitly granting
-    // that SID, which only the workspace has. Previously Everyone and the
-    // logon SID were restricting SIDs too, letting the child write anywhere
-    // those SIDs had write access (e.g. ACL-less FAT/exFAT volumes, where
-    // Everyone is implicitly granted) — including --read-only mode, whose
-    // restricting set consisted of Everyone alone.
-    SID_AND_ATTRIBUTES restrictingSids[1] = {};
-    restrictingSids[0].Sid = workspaceSid;
+    // reads keep using the token's normal user SIDs.
+    //
+    // The restricting set is {workspace SID, logon SID, Everyone}. All three
+    // are needed, for different reasons:
+    //   - workspace SID gates workspace writes: a write there requires an ACE
+    //     explicitly granting that random SID, which only the workspace has.
+    //   - logon SID and Everyone gate *process startup*, not user data. With
+    //     the restricting set narrowed to the workspace SID alone, process
+    //     initialization fails for everything beyond cmd.exe (measured on
+    //     Win11 24H2/25H2, builds 26100/26200: powershell.exe exits 0xC0000142
+    //     STATUS_DLL_INIT_FAILED, where.exe and similar tools silently fail
+    //     to run). Dropping either one still breaks powershell.exe; only the
+    //     full set starts cleanly.
+    // Writes outside the workspace stay denied as long as those SIDs hold no
+    // write ACE on the target — the documented caveat is ACL-less volumes
+    // (FAT/exFAT/network shares), where Everyone is implicitly granted; see
+    // the README "known limitations" note.
+    //
+    // LUA_TOKEN filters an elevated caller down to a limited user so the
+    // child never inherits administrator power even when the sandbox itself
+    // is run elevated.
+    PSID logonSid = NULL;
+    PSID everyoneSid = NULL;
+    {
+        DWORD len = 0;
+        GetTokenInformation(hToken, TokenGroups, NULL, 0, &len);
+        if (len) {
+            TOKEN_GROUPS* tg = (TOKEN_GROUPS*)LocalAlloc(LPTR, len);
+            if (tg && GetTokenInformation(hToken, TokenGroups, tg, len, &len)) {
+                for (DWORD i = 0; i < tg->GroupCount; i++) {
+                    if (tg->Groups[i].Attributes & SE_GROUP_LOGON_ID) {
+                        DWORD sidLen = GetLengthSid(tg->Groups[i].Sid);
+                        logonSid = (PSID)LocalAlloc(LPTR, sidLen);
+                        if (logonSid) CopySid(sidLen, logonSid, tg->Groups[i].Sid);
+                        break;
+                    }
+                }
+            }
+            if (tg) LocalFree(tg);
+        }
+        everyoneSid = (PSID)LocalAlloc(LPTR, SECURITY_MAX_SID_SIZE);
+        if (everyoneSid) {
+            DWORD evSidSize = SECURITY_MAX_SID_SIZE;
+            if (!CreateWellKnownSid(WinWorldSid, NULL, everyoneSid, &evSidSize)) {
+                LocalFree(everyoneSid);
+                everyoneSid = NULL;
+            }
+        }
+    }
+
+    // Both SIDs are required for child process startup. If either is missing
+    // the command may still run, but processes that need a full token
+    // (powershell.exe and friends) will fail to initialize — say so instead
+    // of degrading silently.
+    if (!logonSid || !everyoneSid) {
+        fwprintf(stderr,
+                 L"sandbox: warning: logon/Everyone SID unavailable "
+                 L"(logon=%d everyone=%d); some processes may fail to start\n",
+                 logonSid != NULL, everyoneSid != NULL);
+    }
+
+    SID_AND_ATTRIBUTES restrictingSids[3] = {};
+    DWORD numRestricting = 0;
+    restrictingSids[numRestricting++].Sid = workspaceSid;
+    if (logonSid)    restrictingSids[numRestricting++].Sid = logonSid;
+    if (everyoneSid) restrictingSids[numRestricting++].Sid = everyoneSid;
 
     HANDLE hRestrictedToken = NULL;
     BOOL ok = CreateRestrictedToken(
         hToken,
-        DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
+        DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
         0, NULL,          0, NULL,
-        1, restrictingSids,
+        numRestricting, restrictingSids,
         &hRestrictedToken
     );
     CloseHandle(hToken);
+    LocalFree(logonSid);
+    LocalFree(everyoneSid);
 
     if (!ok) {
         fwprintf(stderr, L"sandbox: CreateRestrictedToken (%lu)\n", GetLastError());
@@ -895,12 +961,24 @@ DWORD WINAPI LockUpdateThreadProc(LPVOID lpParameter) {
 }
 
 /**
- * @brief Check whether a DACL already contains an explicit GENERIC_WRITE
- *        allow-ACE for the given SID.
+ * @brief Access mask the sandbox SID receives on workspace directories.
+ *
+ * Write + execute + delete + child deletion, with READ_CONTROL kept so
+ * generic (GENERIC_WRITE / GENERIC_READ) requests map onto the mask.
+ * WRITE_DAC / WRITE_OWNER stay excluded so a confined child cannot rewrite
+ * DACLs or take ownership to escape the allowlist.
+ */
+static const ACCESS_MASK kWorkspaceGrantMask =
+    (FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD) &
+    ~(WRITE_DAC | WRITE_OWNER);
+
+/**
+ * @brief Check whether a DACL already contains an explicit allow-ACE covering
+ *        the workspace grant mask for the given SID.
  *
  * @param dacl  DACL to inspect
  * @param sid   SID to search for
- * @return true if an allow-ACE with GENERIC_WRITE exists for the SID
+ * @return true if an allow-ACE for the SID covers kWorkspaceGrantMask
  */
 bool hasExplicitAllowWrite(PACL dacl, PSID sid) {
     if (!dacl) return false;
@@ -917,7 +995,7 @@ bool hasExplicitAllowWrite(PACL dacl, PSID sid) {
         ACCESS_MASK mask = (ace->AceType == ACCESS_ALLOWED_ACE_TYPE)
             ? ((ACCESS_ALLOWED_ACE*)ace)->Mask
             : ((ACCESS_ALLOWED_CALLBACK_ACE*)ace)->Mask;
-        if (mask & GENERIC_WRITE) return true;
+        if ((mask & kWorkspaceGrantMask) == kWorkspaceGrantMask) return true;
     }
     return false;
 }
@@ -930,7 +1008,8 @@ bool hasExplicitAllowWrite(PACL dacl, PSID sid) {
  *      left by previous sandbox invocations that crashed before cleanup.
  *      A SID is considered stale if it is a sandbox SID, is not the current
  *      SID, and its lock file has expired.
- *   2. Add a GENERIC_WRITE | GENERIC_EXECUTE | DELETE ACE for the current SID if
+ *   2. Add a kWorkspaceGrantMask ACE (write + execute + delete + child
+ *      deletion, no WRITE_DAC/WRITE_OWNER) for the current SID if
  *      one does not already exist.
  *
  * The ACE is inherited by all files and subdirectories within the workspace.
@@ -1003,9 +1082,15 @@ bool ensureWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
     // --- Step 2: Add write ACE for the current SID (if not already present) ---
     if (!hasExplicitAllowWrite(dacl, sid)) {
         EXPLICIT_ACCESSW ea = { 0 };
-        // GENERIC_WRITE covers file creation/modification but NOT deletion.
-        // DELETE is required for DeleteFileW / RemoveDirectoryW to work.
-        ea.grfAccessPermissions = GENERIC_WRITE | GENERIC_EXECUTE | DELETE;
+        // Explicit least-privilege grant: write + execute + delete + child
+        // deletion, with READ_CONTROL kept so generic (GENERIC_WRITE/READ)
+        // requests map onto the mask. WRITE_DAC / WRITE_OWNER stay excluded
+        // so a confined child cannot rewrite DACLs or take ownership to
+        // escape the allowlist (same grant shape as the deepseek-harness
+        // windows-acl sandbox). DELETE is required for DeleteFileW /
+        // RemoveDirectoryW; FILE_DELETE_CHILD covers child deletion and
+        // renames regardless of the child's own DACL.
+        ea.grfAccessPermissions = kWorkspaceGrantMask;
         ea.grfAccessMode = GRANT_ACCESS;
         ea.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
         ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
