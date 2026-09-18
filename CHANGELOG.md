@@ -9,7 +9,7 @@
 ### Changed
 - CI: Windows 平台跳过测试步骤，仅验证构建——默认 shell 为 powershell（`4c12a93`）时，受限令牌启动的 `powershell.exe` 在 GitHub runner 上无限阻塞导致 ctest 挂起；测试保留在 Linux/macOS CI 与本地 Windows 运行，所有 job 增加 15 分钟超时保护
 - Windows: 工作目录 ACE 从 `GENERIC_WRITE | GENERIC_EXECUTE | DELETE` 改为显式掩码（`FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD`，剔除 `WRITE_DAC | WRITE_OWNER`，保留 `READ_CONTROL` 使 generic 请求可映射）——子进程不再能通过 `icacls`/夺权重写工作区内 DACL；`FILE_DELETE_CHILD` 保证子项删除与重命名不受子项自身 DACL 影响（授权形状对齐 deepseek-harness 的 windows-acl 沙盒）
-- Windows: `CreateRestrictedToken` 增加 `LUA_TOKEN`，提权调用者派生出的也是过滤令牌，子进程不会继承管理员能力
+- Windows: `CreateRestrictedToken` 曾随 `eb7788e` 加入 `LUA_TOKEN`，现**移除**——`WRITE_RESTRICTED` 令牌的写操作要求**正常检查与受限检查同时通过**，而 `LUA_TOKEN` 会把调用者的管理员 SID 标记为 deny-only：在提权调用者（如 GitHub runner）且文件 ACL 仅授予 `Administrators:(F)`+`Users:(RX)` 的环境下，**沙盒运行前就存在的文件**的删除/覆盖会因正常检查失败而被拒（即便受限检查因工作区 SID 的 ACE 而通过），沙盒内新建文件不受影响。移除后提权能力仍受 `DISABLE_MAX_PRIVILEGE` 约束，写隔离由受限检查强制
 
 ### Added
 - Windows: 环境变量 `SANDBOX_FORCE_RESTRICTED_TOKEN=1` 强制走 Restricted Token 回退后端，便于在 24H2+ 机器上对回退后端做回归测试

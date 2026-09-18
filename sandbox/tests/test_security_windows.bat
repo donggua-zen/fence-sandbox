@@ -59,15 +59,7 @@ if exist "%OUTSIDE%\dummy.txt" ( echo [PASS] & set /a FAIL+=0 & set /a PASS+=1 )
 
 :after_test3
 
-:: --- TEMP DIAGNOSTICS (stderr visible, no 2>nul) ---
-echo --- DIAG: backend + grant probe ---
-"%SANDBOX%" --shell cmd -c "echo probe-ok" --workspace "%WS%"
-echo DIAG_PROBE_EXIT=!ERRORLEVEL!
-echo --- DIAG: in-sandbox view of pre-existing file ---
-echo dummy > "%WS%\todelete.txt"
-"%SANDBOX%" --shell cmd -c "icacls todelete.txt & icacls . & whoami /groups & del todelete.txt" --workspace "%WS%"
-echo DIAG_DEL_EXIT=!ERRORLEVEL!
-if exist "%WS%\todelete.txt" (echo DIAG_FILE_STILL_EXISTS) else (echo DIAG_FILE_DELETED)
+echo --- Test 4: Delete file inside workspace (ALLOW) ---
 
 echo --- Test 4: Delete file inside workspace (ALLOW) ---
 echo dummy > "%WS%\todelete.txt"
