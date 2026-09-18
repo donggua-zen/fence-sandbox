@@ -22,6 +22,15 @@ mkdir "%WS%" 2>nul
 mkdir "%WS2%" 2>nul
 mkdir "%OUTSIDE%" 2>nul
 
+:: The "outside (DENY)" cases must measure the sandbox, not the host ACLs.
+:: The Restricted Token backend's restricting set includes Everyone, so on a
+:: permissive volume (e.g. a GitHub runner scratch drive) the host itself lets
+:: the confined child write anywhere and the DENY cases would fail for reasons
+:: unrelated to the sandbox. Normalize the outside dir: drop inheritance, keep
+:: a private grant for the caller, SYSTEM and Administrators only.
+icacls "%OUTSIDE%" /inheritance:r >nul 2>nul
+icacls "%OUTSIDE%" /grant:r "%USERNAME%:(OI)(CI)F" "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" >nul 2>nul
+
 echo ============================================
 echo  AI Sandbox - Windows Security Tests
 echo ============================================
