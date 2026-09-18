@@ -59,24 +59,9 @@ if exist "%OUTSIDE%\dummy.txt" ( echo [PASS] & set /a FAIL+=0 & set /a PASS+=1 )
 
 :after_test3
 
-:: --- TEMP DIAGNOSTICS (CI run 35311145112: Test 4/15 fail on pre-existing
-:: --- files inside the workspace while new-file cases pass) ---
-echo --- DIAG: backend probe (stderr visible) ---
-"%SANDBOX%" --shell cmd -c "echo probe-ok" --workspace "%WS%"
-echo DIAG_PROBE_EXIT=!ERRORLEVEL!
-echo --- DIAG: harness pre-create ---
-echo dummy > "%WS%\todelete.txt"
-echo DIAG_CREATE_EXIT=!ERRORLEVEL!
-if exist "%WS%\todelete.txt" (echo DIAG_FILE_EXISTS) else (echo DIAG_FILE_MISSING)
-echo --- DIAG: workspace DACL ---
-icacls "%WS%" 2>&1
-echo --- DIAG: pre-created file DACL ---
-icacls "%WS%\todelete.txt" 2>&1
-
 echo --- Test 4: Delete file inside workspace (ALLOW) ---
 echo dummy > "%WS%\todelete.txt"
-"%SANDBOX%" --shell cmd -c "del todelete.txt" --workspace "%WS%"
-echo DIAG_DEL_EXIT=!ERRORLEVEL!
+"%SANDBOX%" --shell cmd -c "del todelete.txt" --workspace "%WS%" 2>nul
 if exist "%WS%\todelete.txt" ( echo [FAIL] & set /a FAIL+=1 ) else ( echo [PASS] & set /a PASS+=1 )
 
 echo --- Test 5: Create directory inside workspace (ALLOW) ---

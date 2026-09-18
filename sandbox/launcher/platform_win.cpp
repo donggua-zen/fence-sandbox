@@ -393,6 +393,9 @@ static HANDLE createKillOnCloseJob() {
  * @return true if the command was executed via the sandbox API, false if the
  *         caller should fall back
  */
+static bool ensureWorkspaceWriteAcl(PCWSTR workspace, PSID sid);
+static bool removeWorkspaceWriteAcl(PCWSTR workspace, PSID sid);
+
 static bool runWithSandboxApi(
     const std::wstring& cmdLine,
     const std::wstring& workingDir,
@@ -450,6 +453,41 @@ static bool runWithSandboxApi(
         return false;
     }
 
+    // 3b. Grant the AppContainer SID the workspace grant mask on every
+    //     workspace. The engine's fs_read_write binding only lets the child
+    //     *create* new files; modifying or deleting a file that already
+    //     exists requires the file's own DACL to grant the AppContainer SID,
+    //     which typical host ACLs do not (observed on GitHub runners:
+    //     BUILTIN\Users:(RX) only — every pre-existing-file case failed with
+    //     "Access is denied"). Same grant shape as the Restricted Token
+    //     backend; the ACEs are removed again during cleanup below. This
+    //     also makes each run's SID single-purpose, so a leftover ACE from a
+    //     killed launcher is inert.
+    std::vector<std::wstring> grantedWorkspaces;
+    PSID appContainerSid = NULL;
+    HRESULT sidHr = DeriveAppContainerSidFromAppContainerName(identity.c_str(),
+                                                              &appContainerSid);
+    if (FAILED(sidHr) || !appContainerSid) {
+        fwprintf(stderr, L"sandbox: cannot derive AppContainer SID (0x%08X)\n",
+                 (unsigned)sidHr);
+        DeleteAppContainerProfile(identity.c_str());
+        FreeLibrary(hMod);
+        return false;
+    }
+    if (!readOnly) {
+        for (const auto& ws : wWorkspaces) {
+            if (ensureWorkspaceWriteAcl(ws.c_str(), appContainerSid)) {
+                grantedWorkspaces.push_back(ws);
+            }
+        }
+    }
+    auto cleanupAppContainer = [&]() {
+        for (const auto& ws : grantedWorkspaces)
+            removeWorkspaceWriteAcl(ws.c_str(), appContainerSid);
+        LocalFree(appContainerSid);
+        DeleteAppContainerProfile(identity.c_str());
+    };
+
     // 4. Set up STARTUPINFO with stdio handle passthrough
     HANDLE hStdin  = GetStdHandle(STD_INPUT_HANDLE);
     HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -471,7 +509,7 @@ static bool runWithSandboxApi(
     WCHAR* cmdCopy = (WCHAR*)LocalAlloc(LPTR,
         (cmdLine.size() + 1) * sizeof(WCHAR));
     if (!cmdCopy) {
-        DeleteAppContainerProfile(identity.c_str());
+        cleanupAppContainer();
         FreeLibrary(hMod);
         return false;
     }
@@ -502,7 +540,7 @@ static bool runWithSandboxApi(
 
     if (!ok) {
         // API call failed — fall back to Restricted Token
-        DeleteAppContainerProfile(identity.c_str());
+        cleanupAppContainer();
         if (hJob) CloseHandle(hJob);
         FreeLibrary(hMod);
         return false;
@@ -531,9 +569,10 @@ static bool runWithSandboxApi(
     CloseHandle(pi.hThread);
     if (hJob) CloseHandle(hJob);
 
-    // Drop this run's profile: the engine rejects an identity whose profile is
-    // still registered, so leaving it behind would break the next run.
-    DeleteAppContainerProfile(identity.c_str());
+    // Drop this run's ACEs and profile: the engine rejects an identity whose
+    // profile is still registered, so leaving either behind would break the
+    // next run.
+    cleanupAppContainer();
 
     *exitCodeOut = (int)exitCode;
     return true;
