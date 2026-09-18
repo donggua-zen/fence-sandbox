@@ -190,10 +190,9 @@ proc.on('exit', (code) => {
 
 - Windows: 命令默认通过 `powershell.exe -NoProfile -NonInteractive -Command` 执行，可用 `--shell cmd` 切换为 `cmd.exe /c`；Linux: 命令默认通过 `sh -c` 执行，可用 `--shell bash` 切换为 `bash -c`；macOS: 命令默认通过 `sh -c` 执行，可用 `--shell bash`/`--shell zsh` 切换，经 `/usr/bin/sandbox-exec` 应用 Seatbelt 沙箱
 - Windows: 受限令牌的 restricting SID 列表为 `{workspace SID, logon SID, Everyone}`——三者缺一会导致进程无法初始化（`powershell.exe` 报 `0xC0000142`、`where.exe` 一类工具静默失败）。历史上曾把列表收窄为仅 workspace SID（`ee5c242`），默认 shell 改为 powershell 后该回归在默认路径上必现，现已恢复。详见 CHANGELOG
-- Windows: 受限令牌启动的 `powershell.exe` 在部分环境（如 GitHub Windows runner）曾出现阻塞，CI 通过 `SANDBOX_TEST_SKIP_DEFAULT_SHELL` 跳过默认 shell 用例；该阻塞是否随上述 restricting SID 修复一并消失，尚待在 runner 上复测；Win11 24H2+ Sandbox API（AppContainer）路径仍待真机验证
+- Windows: 受限令牌启动的 `powershell.exe` 在部分环境（如 GitHub Windows runner）曾出现阻塞，CI 通过 `SANDBOX_TEST_SKIP_DEFAULT_SHELL` 跳过默认 shell 用例；该阻塞是否随上述 restricting SID 修复一并消失，尚待在 runner 上复测
 - Windows（已知限制）: Restricted Token 回退后端能否拦截工作目录外的文件删除取决于内核对 `WRITE_RESTRICTED` 的实现——Win11 25H2（build 26200）实测已覆盖 `DELETE`（删除被拦截），更旧的 Windows 构建上可能仍存在缺口；Linux（Landlock）与 macOS（Seatbelt）不受影响。详见 CHANGELOG "Known issues"
-- Windows（已知限制）: 设计上默认走 Win11 24H2+ Sandbox API（AppContainer）后端，但实测在 Win11 25H2（build 26200）上该后端未生效——`Experimental_CreateProcessInSandbox` 返回 FALSE 且 `GetLastError=183`（ERROR_ALREADY_EXISTS），每次静默回退到 Restricted Token。因此当前 Windows 的实际隔离全部由回退后端提供；上一条"无 ACL 卷不拦截"的限制也源于此，待 AppContainer 路径修复后消除
-- Windows: 设置环境变量 `SANDBOX_FORCE_RESTRICTED_TOKEN=1` 可强制走 Restricted Token 回退后端（用于在 24H2+ 机器上测试回退后端）
+- Windows: 24H2+ 默认走 Sandbox API（AppContainer）后端——默认拒绝、每次运行使用唯一 profile 名并即时清理；为保持"目录外只读"语义，各本地盘根会以 `fs_read_only` 声明（网络盘除外）。PowerShell 在该后端下会打印一条 `InitializeDefaultDrives` 失败噪音，不影响行为。设置环境变量 `SANDBOX_FORCE_RESTRICTED_TOKEN=1` 可强制走 Restricted Token 回退后端（用于 24H2+ 机器上的回归测试）
 - 工作目录路径不存在时会自动创建
 - Windows: `.sandbox/` 目录用于存放 lock 文件（隐藏属性），请勿手动删除
 - Linux: 无额外文件，无残留

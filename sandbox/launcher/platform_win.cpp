@@ -73,6 +73,28 @@ static std::string wideToUtf8(const std::wstring& wide) {
     return utf8;
 }
 
+/**
+ * @brief Append every local drive root (e.g. "C:\\") to a path list.
+ *
+ * Used to declare the whole machine as read-only for the AppContainer
+ * backend. Network drives are deliberately left out: declaring an unreachable
+ * UNC root risks stalling process creation, and a confined process reading
+ * local media covers the practical cases. The Restricted Token backend, which
+ * does not restrict reads at all, therefore stays slightly wider here.
+ *
+ * @param out  List to append UTF-8 drive roots to
+ */
+static void appendDriveRoots(std::vector<std::string>& out) {
+    WCHAR drives[512] = { 0 };
+    if (!GetLogicalDriveStringsW(511, drives)) return;
+    for (WCHAR* p = drives; *p; p += wcslen(p) + 1) {
+        UINT type = GetDriveTypeW(p);
+        if (type == DRIVE_FIXED || type == DRIVE_REMOVABLE || type == DRIVE_CDROM) {
+            out.push_back(wideToUtf8(p));
+        }
+    }
+}
+
 // ============================================================
 //  FlatBuffer SandboxSpec builder for Experimental_CreateProcessInSandbox
 // ============================================================
@@ -98,8 +120,13 @@ static std::string wideToUtf8(const std::wstring& wide) {
 /**
  * @brief Build a FlatBuffer SandboxSpec binary blob.
  *
- * Only version, app_container, and fs_read_write (or fs_read_only in
- * read-only mode) are populated. All other fields use schema defaults.
+ * Only version, app_container, fs_read_write and fs_read_only are populated.
+ * All other fields use schema defaults.
+ *
+ * Both path lists matter in normal operation: AppContainer is default-deny,
+ * so without the read-only roots the child would lose read access to
+ * everything outside the workspace — which is not the product semantic (only
+ * *writes* are meant to be confined).
  *
  * @param readWritePaths  UTF-8 directory paths with read/write access
  * @param readOnlyPaths   UTF-8 directory paths with read-only access
@@ -115,7 +142,6 @@ static bool buildSandboxSpec(
 
     bool hasRW = !readWritePaths.empty();
     bool hasRO = !readOnlyPaths.empty();
-    const auto& paths = hasRW ? readWritePaths : readOnlyPaths;
 
     // Lambda helpers for little-endian writes
     auto writeU16 = [&](uint16_t v) {
@@ -143,7 +169,7 @@ static bool buildSandboxSpec(
     pad4();
     size_t vtablePos = outBuf.size();
     writeU16(4 + 2 * 9);  // vtable_size = 22
-    writeU16(16);          // table_data_size = 16
+    writeU16(20);          // table_data_size = 20
     writeU16(4);   // field 0: version, at table+4
     writeU16(8);   // field 1: app_container, at table+8
     writeU16(0);   // field 2: not present
@@ -151,33 +177,57 @@ static bool buildSandboxSpec(
     writeU16(0);   // field 4: not present
     writeU16(0);   // field 5: not present
     writeU16(0);   // field 6: not present
-    writeU16(hasRW ? 12 : 0);  // field 7: fs_read_write
-    writeU16(hasRO ? 12 : 0);  // field 8: fs_read_only
+    writeU16(hasRW ? 12 : 0);  // field 7: fs_read_write, at table+12
+    writeU16(hasRO ? 16 : 0);  // field 8: fs_read_only, at table+16
 
-    // 3. Root Table (16 bytes)
+    // 3. Root Table (20 bytes)
     pad4();  // Align table start to 4 bytes
     size_t tablePos = outBuf.size();
     writeI32((int32_t)(tablePos - vtablePos));  // soffset to vtable
 
-    size_t field0Pos = outBuf.size();  // version string offset slot
+    size_t fieldVersionPos = outBuf.size();  // version string offset slot
     writeU32(0);  // placeholder
 
     outBuf.push_back(1);  // field 1: app_container = true
     pad4();  // align for the next uint32 field
 
-    size_t fieldVecPos = outBuf.size();  // vector offset slot
+    size_t fieldRWPos = outBuf.size();  // fs_read_write vector offset slot
     writeU32(0);  // placeholder
 
-    // 4. Vector of string offsets (fs_read_write or fs_read_only)
-    pad4();
-    size_t vecPos = outBuf.size();
-    writeU32((uint32_t)paths.size());  // element count
+    size_t fieldROPos = outBuf.size();  // fs_read_only vector offset slot
+    writeU32(0);  // placeholder
 
-    std::vector<size_t> stringOffsetSlots;
-    for (size_t i = 0; i < paths.size(); i++) {
-        stringOffsetSlots.push_back(outBuf.size());
-        writeU32(0);  // placeholder for string offset
-    }
+    // 4. Vectors of string offsets. Both are emitted: the workspace grants
+    //    read/write while the read-only roots (drive roots, see the caller)
+    //    keep everything else readable.
+    struct VecInfo {
+        size_t vecPos;
+        std::vector<size_t> slotPos;
+        std::vector<size_t> strPos;
+    };
+    auto emitVector = [&](const std::vector<std::string>& paths) -> VecInfo {
+        VecInfo vi;
+        pad4();
+        vi.vecPos = outBuf.size();
+        writeU32((uint32_t)paths.size());  // element count
+        for (size_t i = 0; i < paths.size(); i++) {
+            vi.slotPos.push_back(outBuf.size());
+            writeU32(0);  // placeholder for string offset
+        }
+        for (size_t i = 0; i < paths.size(); i++) {
+            pad4();
+            vi.strPos.push_back(outBuf.size());
+            writeU32((uint32_t)paths[i].length());
+            outBuf.insert(outBuf.end(), paths[i].begin(), paths[i].end());
+            outBuf.push_back(0);  // null terminator
+            pad4();
+        }
+        return vi;
+    };
+    VecInfo rwInfo = { 0, {}, {} };
+    VecInfo roInfo = { 0, {}, {} };
+    if (hasRW) rwInfo = emitVector(readWritePaths);
+    if (hasRO) roInfo = emitVector(readOnlyPaths);
 
     // 5. Version string "0.1.0"
     pad4();
@@ -188,37 +238,27 @@ static bool buildSandboxSpec(
     outBuf.push_back(0);  // null terminator
     pad4();
 
-    // 6. Workspace path strings
-    std::vector<size_t> stringPositions;
-    for (const auto& path : paths) {
-        pad4();
-        stringPositions.push_back(outBuf.size());
-        writeU32((uint32_t)path.length());
-        outBuf.insert(outBuf.end(), path.begin(), path.end());
-        outBuf.push_back(0);  // null terminator
-        pad4();
-    }
-
-    // 7. Fill in all offsets (relative to each offset's stored position)
+    // 6. Fill in all offsets (relative to each offset's stored position)
     // Root table offset
     uint32_t rootOffset = (uint32_t)tablePos;
     memcpy(&outBuf[headerPos], &rootOffset, sizeof(rootOffset));
 
-    // Version string offset (relative to field0Pos)
-    uint32_t verOffset = (uint32_t)(versionPos - field0Pos);
-    memcpy(&outBuf[field0Pos], &verOffset, sizeof(verOffset));
+    // Version string offset (relative to fieldVersionPos)
+    uint32_t verOffset = (uint32_t)(versionPos - fieldVersionPos);
+    memcpy(&outBuf[fieldVersionPos], &verOffset, sizeof(verOffset));
 
-    // Vector offset (relative to fieldVecPos)
-    if (!paths.empty()) {
-        uint32_t vecOffset = (uint32_t)(vecPos - fieldVecPos);
-        memcpy(&outBuf[fieldVecPos], &vecOffset, sizeof(vecOffset));
-    }
-
-    // String offsets in vector (relative to each slot position)
-    for (size_t i = 0; i < paths.size(); i++) {
-        uint32_t strOffset = (uint32_t)(stringPositions[i] - stringOffsetSlots[i]);
-        memcpy(&outBuf[stringOffsetSlots[i]], &strOffset, sizeof(strOffset));
-    }
+    // Vector + string offsets
+    auto fillVector = [&](const VecInfo& vi, size_t fieldPos) {
+        if (vi.vecPos == 0) return;
+        uint32_t vecOffset = (uint32_t)(vi.vecPos - fieldPos);
+        memcpy(&outBuf[fieldPos], &vecOffset, sizeof(vecOffset));
+        for (size_t i = 0; i < vi.slotPos.size(); i++) {
+            uint32_t strOffset = (uint32_t)(vi.strPos[i] - vi.slotPos[i]);
+            memcpy(&outBuf[vi.slotPos[i]], &strOffset, sizeof(strOffset));
+        }
+    };
+    fillVector(rwInfo, fieldRWPos);
+    fillVector(roInfo, fieldROPos);
 
     return true;
 }
@@ -373,6 +413,12 @@ static bool runWithSandboxApi(
     }
 
     // 2. Build the FlatBuffer SandboxSpec
+    //    AppContainer is default-deny for reads as well as writes, so the
+    //    drive roots are declared read-only to keep the product semantic:
+    //    readable everywhere, writable only inside the workspace. This is
+    //    also what lets the default shell work — without a readable C:\,
+    //    PowerShell's FileSystem provider fails to initialise, relative paths
+    //    resolve to C:\ and every relative command is refused.
     std::vector<std::string> rwPaths, roPaths;
     if (!readOnly) {
         for (const auto& ws : wWorkspaces)
@@ -381,6 +427,7 @@ static bool runWithSandboxApi(
         for (const auto& ws : wWorkspaces)
             roPaths.push_back(wideToUtf8(ws));
     }
+    appendDriveRoots(roPaths);
 
     std::vector<uint8_t> specBuf;
     if (!buildSandboxSpec(rwPaths, roPaths, specBuf)) {

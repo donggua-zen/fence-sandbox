@@ -31,6 +31,8 @@
 - build_project.bat 自动探测 Visual Studio 路径
 
 ### Fixed
+- Windows: **AppContainer 后端首次真正生效**。identity 原本固定为 `AISandbox.Container.v1`，而引擎把该参数当作 AppContainer profile 名并自行创建/打开——profile 已存在即返回 FALSE + `GetLastError=183`（ERROR_ALREADY_EXISTS），于是除首次外每次运行都静默回退到 Restricted Token。改为**每次运行生成唯一 identity**（`AISandbox-<pid>-<16 位随机十六进制>`），用后 `DeleteAppContainerProfile` 清理（含全部失败路径）。实测 16/16 用例全部由 AppContainer 承接，无回退
+- Windows: `buildSandboxSpec` 现在同时下发 `fs_read_write` 与 `fs_read_only`（此前二选一、共用同一 table 槽位）。AppContainer 对**读**同样是默认拒绝，只声明工作区会让子进程失去目录外读取能力，与"工作目录外只读"的产品语义冲突。现把各本地盘根（`GetLogicalDriveStringsW` 取 `DRIVE_FIXED|DRIVE_REMOVABLE|DRIVE_CDROM`）作为只读根一并声明，网络盘刻意排除以免不可达 UNC 拖住进程创建。附带修好了默认 shell：`C:\` 不可读时 PowerShell 的 FileSystem provider 初始化失败、相对路径被解析成 `C:\`，补上只读根后相对路径恢复正常。实测（build 26200）PS 绝对/相对写内、目录外写删拒绝、目录外读放行、只读模式写拒读放、退出码透传、多工作区全通过
 - Linux: Landlock `WRITE_ACCESS_MASK` 未 handle `REMOVE_DIR`，工作目录外空目录可被 `rmdir` 删除（所有 Linux 构建受影响）；补上该权限位并新增 rmdir 回归用例
 - Linux: 无 `<linux/landlock.h>` 时的 fallback 常量与内核 UAPI 位值错位（REMOVE_FILE 从 bit2 起），按官方位序修正（v5.13/v6.2/master 三处核对一致）；`packed` 与内核 UAPI 相同属正确写法，保留；ABI < 3 内核增加 truncate 缺口警告
 - Windows: AppContainer 后端用 `-1` 兼作"回落"哨兵与子进程退出码，退出码 ≥ 0x80000000 的命令（如 `exit -1`）会被 Restricted Token 后端重复执行——退出码改由出参传递
@@ -42,8 +44,9 @@
 ### Known issues
 - Windows: Restricted Token 回退后端能否拦截**工作目录外的删除**取决于内核对 `WRITE_RESTRICTED` 的实现。2026-09 在 Win11 25H2（build 26200）实测：内核的 restricted 检查已覆盖 `DELETE`（绕过 cmd 直接调 `DeleteFileW` 的探针亦被拒），回退后端可正常拦截工作目录外删除；在更旧的 Windows 构建上该检查可能不覆盖 `DELETE`，缺口仍会存在。CI 暂以 `SANDBOX_TEST_SKIP_DELETE_OUTSIDE` 跳过该用例，待多 Windows 版本矩阵验证后再决定是否移除。彻底的机制级修复（默认拒绝）需以 AppContainer 后端为主（Win11 24H2+）；在不牺牲"工作目录外可读"的前提下，纯 Restricted Token 机制无法强制拦截（全 RESTRICTED 令牌会同时拦截读取，破坏产品语义）
 - Linux: 子进程未 `chdir()` 到工作目录，导致相对路径命令在工作目录外执行（Windows 通过 `CreateProcessAsUserW` 的 `lpCurrentDirectory` 正确设置，Linux 缺失）
-- Windows: restricting SID 含 `Everyone`，因此在**无 ACL 的卷**（FAT/exFAT/网络共享，Everyone 被隐式授予）上，工作目录外的写入/删除不会被拦截——这是"受限令牌下进程可正常启动"与"无 ACL 卷可拦截"之间的取舍。彻底解法是以默认拒绝的 AppContainer 后端为主（见下条），或对非 NTFS 卷检测后拒绝运行
-- Windows: 已知问题——AppContainer 主后端在本机未生效。Win11 25H2（build 26200）实测 `Experimental_CreateProcessInSandbox` 返回 FALSE 且 `GetLastError=183`（ERROR_ALREADY_EXISTS），每次调用都静默回退到 Restricted Token 后端；本机 `processmodel.dll` 存在且导出可用，故非系统版本问题。当前 Windows 侧全部隔离语义实际由回退后端承担，AppContainer 的默认拒绝能力（含无 ACL 卷与工作目录外删除）尚未兑现，已列为后续修复项
+- Windows: **Restricted Token 回退后端**的 restricting SID 含 `Everyone`，因此在无 ACL 的卷（FAT/exFAT/网络共享，Everyone 被隐式授予）上，工作目录外的写入/删除不会被拦截——这是"受限令牌下进程可正常启动"与"无 ACL 卷可拦截"之间的取舍。24H2+ 上默认走 AppContainer（默认拒绝，无此问题）；后续可在 AppContainer 稳定后从 restricting 列表移除 `Everyone`（保留 logon SID），让回退后端也收窄
+- Windows: AppContainer 后端下，PowerShell 启动时仍会向 stderr 打印 `尝试对 FileSystem 提供程序执行 InitializeDefaultDrives 操作失败`。这是 PS 在受限容器内的既有噪音，**不影响行为**（当前目录正确、相对路径正常、读写均正常），暂不处理
+- Windows: 每次运行都会创建并删除一个 AppContainer profile；若 launcher 被强杀，profile 会残留（名字含 pid，无毒但会累积）。暂未做陈旧 profile 清理
 
 ## [1.0.0] - 2025-07-31
 
