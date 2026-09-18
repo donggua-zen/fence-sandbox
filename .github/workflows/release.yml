@@ -61,19 +61,26 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure
 
-      - name: Package
+      # GNU tar (Git Bash on Windows runners) cannot write the zip format, so
+      # `tar -a -c -f x.zip` silently produced a plain tar named .zip. Use
+      # PowerShell's Compress-Archive for the Windows package instead.
+      - name: Package (Windows zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path build/bin/sandbox.exe `
+            -DestinationPath dist/fence-sandbox-windows-x64.zip
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           ARCH=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
           mkdir -p dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            tar -a -c -f "dist/fence-sandbox-${{ matrix.artifact }}-${ARCH}.zip" \
-              -C build/bin "${{ matrix.binary }}"
-          else
-            tar -czf "dist/fence-sandbox-${{ matrix.artifact }}-${ARCH}.tar.gz" \
-              -C build/bin "${{ matrix.binary }}"
-          fi
+          tar -czf "dist/fence-sandbox-${{ matrix.artifact }}-${ARCH}.tar.gz" \
+            -C build/bin "${{ matrix.binary }}"
           ls -la dist/
 
       - name: Upload artifact
