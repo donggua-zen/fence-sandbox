@@ -476,7 +476,14 @@ static bool runWithSandboxApi(
     }
     if (!readOnly) {
         for (const auto& ws : wWorkspaces) {
-            if (ensureWorkspaceWriteAcl(ws.c_str(), appContainerSid)) {
+            BOOL grantOk = ensureWorkspaceWriteAcl(ws.c_str(), appContainerSid);
+            WCHAR* sidStr = NULL;
+            ConvertSidToStringSidW(appContainerSid, &sidStr);
+            fwprintf(stderr, L"sandbox: [diag] appcontainer ACE grant ws=%ls ok=%d sid=%ls err=%lu\n",
+                     ws.c_str(), grantOk ? 1 : 0, sidStr ? sidStr : L"?",
+                     grantOk ? 0 : GetLastError());
+            if (sidStr) LocalFree(sidStr);
+            if (grantOk) {
                 grantedWorkspaces.push_back(ws);
             }
         }
@@ -1159,7 +1166,11 @@ bool ensureWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
         (LPWSTR)workspace, SE_FILE_OBJECT,
         DACL_SECURITY_INFORMATION,
         NULL, NULL, &dacl, NULL, &sd);
-    if (err != ERROR_SUCCESS) return false;
+    if (err != ERROR_SUCCESS) {
+        fwprintf(stderr, L"sandbox: [diag] GetNamedSecurityInfoW(%ls) failed %lu\n",
+                 workspace, err);
+        return false;
+    }
 
     // --- Step 1: Remove zombie sandbox SIDs (stale ACEs from crashed processes) ---
     DWORD keepCount = 0;
@@ -1238,6 +1249,12 @@ bool ensureWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
                 DACL_SECURITY_INFORMATION,
                 NULL, NULL, newDacl, NULL);
             LocalFree(newDacl);
+            if (err != ERROR_SUCCESS)
+                fwprintf(stderr, L"sandbox: [diag] SetNamedSecurityInfoW(%ls) failed %lu\n",
+                         workspace, err);
+        } else {
+            fwprintf(stderr, L"sandbox: [diag] SetEntriesInAclW(%ls) failed %lu\n",
+                     workspace, err);
         }
     }
 
