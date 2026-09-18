@@ -59,9 +59,15 @@ if exist "%OUTSIDE%\dummy.txt" ( echo [PASS] & set /a FAIL+=0 & set /a PASS+=1 )
 
 :after_test3
 
+:: --- TEMP DIAGNOSTICS (stderr visible, no 2>nul) ---
+echo --- DIAG: backend + grant probe ---
+"%SANDBOX%" --shell cmd -c "echo probe-ok" --workspace "%WS%"
+echo DIAG_PROBE_EXIT=!ERRORLEVEL!
+
 echo --- Test 4: Delete file inside workspace (ALLOW) ---
 echo dummy > "%WS%\todelete.txt"
-"%SANDBOX%" --shell cmd -c "del todelete.txt" --workspace "%WS%" 2>nul
+"%SANDBOX%" --shell cmd -c "del todelete.txt" --workspace "%WS%"
+echo DIAG_DEL_EXIT=!ERRORLEVEL!
 if exist "%WS%\todelete.txt" ( echo [FAIL] & set /a FAIL+=1 ) else ( echo [PASS] & set /a PASS+=1 )
 
 echo --- Test 5: Create directory inside workspace (ALLOW) ---
