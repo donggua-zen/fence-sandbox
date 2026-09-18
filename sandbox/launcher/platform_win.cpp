@@ -261,6 +261,38 @@ static bool ensureAppContainerProfile(PCWSTR identity) {
     return false;
 }
 
+/**
+ * @brief Build a unique AppContainer profile name for this run.
+ *
+ * The sandbox engine returns ERROR_ALREADY_EXISTS when `identity` names a
+ * profile that is already registered — so a fixed profile name works on the
+ * first run and silently falls back to the Restricted Token backend on every
+ * run after that. Generate a fresh name per invocation instead and delete the
+ * profile once the child has exited.
+ *
+ * Format: `AISandbox-<pid>-<16 hex digits>` — hyphen-separated, as
+ * AppContainer profile names reject some punctuation, and short enough to sit
+ * well inside the 64-character limit.
+ *
+ * @param out  Receives the generated profile name
+ * @return true on success, false if the RNG is unavailable
+ */
+static bool makeAppContainerIdentity(std::wstring& out) {
+    HCRYPTPROV hProv = 0;
+    if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+        return false;
+    DWORD r[2] = { 0, 0 };
+    BOOL ok = CryptGenRandom(hProv, sizeof(r), (BYTE*)r);
+    CryptReleaseContext(hProv, 0);
+    if (!ok) return false;
+
+    WCHAR buf[64];
+    _snwprintf_s(buf, _TRUNCATE, L"AISandbox-%lu-%08lX%08lX",
+                 GetCurrentProcessId(), r[0], r[1]);
+    out.assign(buf);
+    return true;
+}
+
 // ============================================================
 //  Experimental_CreateProcessInSandbox API types and wrapper
 // ============================================================
@@ -356,10 +388,16 @@ static bool runWithSandboxApi(
         return false;
     }
 
-    // 3. Use a stable identity (AppContainer profile is persistent, not ephemeral)
-    //    Then ensure the profile is registered via CreateAppContainerProfile.
-    static const WCHAR kIdentity[] = L"AISandbox.Container.v1";
-    if (!ensureAppContainerProfile(kIdentity)) {
+    // 3. Register a fresh AppContainer profile for this run. A fixed identity
+    //    cannot be reused: the engine fails with ERROR_ALREADY_EXISTS as soon
+    //    as the profile exists, which silently demotes every run after the
+    //    first one to the Restricted Token backend. Deleted again below.
+    std::wstring identity;
+    if (!makeAppContainerIdentity(identity)) {
+        FreeLibrary(hMod);
+        return false;
+    }
+    if (!ensureAppContainerProfile(identity.c_str())) {
         // profile registration failed → API won't accept the identity, fall back
         FreeLibrary(hMod);
         return false;
@@ -385,7 +423,11 @@ static bool runWithSandboxApi(
     // 5. Build mutable command line buffer
     WCHAR* cmdCopy = (WCHAR*)LocalAlloc(LPTR,
         (cmdLine.size() + 1) * sizeof(WCHAR));
-    if (!cmdCopy) { FreeLibrary(hMod); return false; }
+    if (!cmdCopy) {
+        DeleteAppContainerProfile(identity.c_str());
+        FreeLibrary(hMod);
+        return false;
+    }
     wcscpy_s(cmdCopy, cmdLine.size() + 1, cmdLine.c_str());
 
     // 6. Create Job Object (ensures child is killed if parent dies)
@@ -403,7 +445,7 @@ static bool runWithSandboxApi(
         NULL,               // environment (inherit parent's)
         workingDir.c_str(),
         &si,
-        kIdentity,
+        identity.c_str(),
         specBuf.data(),
         (DWORD)specBuf.size(),
         &pi
@@ -413,6 +455,7 @@ static bool runWithSandboxApi(
 
     if (!ok) {
         // API call failed — fall back to Restricted Token
+        DeleteAppContainerProfile(identity.c_str());
         if (hJob) CloseHandle(hJob);
         FreeLibrary(hMod);
         return false;
@@ -440,6 +483,10 @@ static bool runWithSandboxApi(
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     if (hJob) CloseHandle(hJob);
+
+    // Drop this run's profile: the engine rejects an identity whose profile is
+    // still registered, so leaving it behind would break the next run.
+    DeleteAppContainerProfile(identity.c_str());
 
     *exitCodeOut = (int)exitCode;
     return true;
