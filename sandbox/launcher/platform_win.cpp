@@ -768,9 +768,16 @@ int run(const Config& cfg) {
     // (FAT/exFAT/network shares), where Everyone is implicitly granted; see
     // the README "known limitations" note.
     //
-    // LUA_TOKEN filters an elevated caller down to a limited user so the
-    // child never inherits administrator power even when the sandbox itself
-    // is run elevated.
+    // LUA_TOKEN must NOT be used here. It marks the caller's administrative
+    // SIDs use-for-deny-only in the child's *normal* token, and a
+    // WRITE_RESTRICTED token requires BOTH the normal check and the
+    // restricted check to succeed for write-type accesses. On an elevated
+    // caller (e.g. GitHub runners) whose files grant full control only to
+    // Administrators + read to Users, the normal check then fails for any
+    // operation on a file that predates the run — delete/overwrite inside
+    // the workspace were denied even though the workspace SID's ACE granted
+    // them and the restricted check passed. Write confinement is enforced by
+    // the restricted check alone.
     PSID logonSid = NULL;
     PSID everyoneSid = NULL;
     {
@@ -820,7 +827,7 @@ int run(const Config& cfg) {
     HANDLE hRestrictedToken = NULL;
     BOOL ok = CreateRestrictedToken(
         hToken,
-        DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+        DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
         0, NULL,          0, NULL,
         numRestricting, restrictingSids,
         &hRestrictedToken
