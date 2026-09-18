@@ -44,7 +44,7 @@
 ### Known issues
 - Windows: Restricted Token 回退后端能否拦截**工作目录外的删除**取决于内核对 `WRITE_RESTRICTED` 的实现。2026-09 在 Win11 25H2（build 26200）实测：内核的 restricted 检查已覆盖 `DELETE`（绕过 cmd 直接调 `DeleteFileW` 的探针亦被拒），回退后端可正常拦截工作目录外删除；在更旧的 Windows 构建上该检查可能不覆盖 `DELETE`，缺口仍会存在。CI 暂以 `SANDBOX_TEST_SKIP_DELETE_OUTSIDE` 跳过该用例，待多 Windows 版本矩阵验证后再决定是否移除。彻底的机制级修复（默认拒绝）需以 AppContainer 后端为主（Win11 24H2+）；在不牺牲"工作目录外可读"的前提下，纯 Restricted Token 机制无法强制拦截（全 RESTRICTED 令牌会同时拦截读取，破坏产品语义）
 - Linux: 子进程未 `chdir()` 到工作目录，导致相对路径命令在工作目录外执行（Windows 通过 `CreateProcessAsUserW` 的 `lpCurrentDirectory` 正确设置，Linux 缺失）
-- Windows: **Restricted Token 回退后端**的 restricting SID 含 `Everyone`，因此在无 ACL 的卷（FAT/exFAT/网络共享，Everyone 被隐式授予）上，工作目录外的写入/删除不会被拦截——这是"受限令牌下进程可正常启动"与"无 ACL 卷可拦截"之间的取舍。24H2+ 上默认走 AppContainer（默认拒绝，无此问题）；后续可在 AppContainer 稳定后从 restricting 列表移除 `Everyone`（保留 logon SID），让回退后端也收窄
+- Windows: **Restricted Token 回退后端**的 restricting SID 含 `Everyone`，因此在无 ACL 的卷（FAT/exFAT/网络共享，Everyone 被隐式授予）上，工作目录外的写入/删除不会被拦截——这是"受限令牌下进程可正常启动"与"无 ACL 卷可拦截"之间的取舍。24H2+ 上默认走 AppContainer（默认拒绝，无此问题）。`Everyone` **有意保留**（连同 logon SID）：旧设备/旧 Windows 构建上回退后端仍是主路径，移除会导致进程无法初始化（见上文 Fixed 条目）
 - Windows: AppContainer 后端下，PowerShell 启动时仍会向 stderr 打印 `尝试对 FileSystem 提供程序执行 InitializeDefaultDrives 操作失败`。这是 PS 在受限容器内的既有噪音，**不影响行为**（当前目录正确、相对路径正常、读写均正常），暂不处理
 - Windows: 每次运行都会创建并删除一个 AppContainer profile；若 launcher 被强杀，profile 会残留（名字含 pid，无毒但会累积）。暂未做陈旧 profile 清理
 
