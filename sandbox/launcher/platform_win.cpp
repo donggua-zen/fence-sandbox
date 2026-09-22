@@ -41,6 +41,15 @@
 /// Lock files older than 30 minutes are considered stale (process crashed).
 #define LOCK_EXPIRE_THRESHOLD_MS (30 * 60 * 1000)
 
+/// Per-path DACL lock: how long to wait for a peer before failing closed. The
+/// critical section is a DACL read-merge-write, and a first grant propagates
+/// eagerly through the whole workspace tree (minutes on a large workspace), so
+/// the budget has to cover a peer's full propagation.
+#define ACL_LOCK_TIMEOUT_MS (30 * 60 * 1000)
+
+/// Per-path DACL lock: retry interval while a peer holds the lock.
+#define ACL_LOCK_RETRY_MS 50
+
 // ============================================================
 //  UTF-8 <-> Wide string conversion
 // ============================================================
@@ -264,6 +273,175 @@ static bool buildSandboxSpec(
 }
 
 // ============================================================
+//  Deterministic workspace capability identity
+// ============================================================
+//
+// The write identity is a PURE FUNCTION of the canonical workspace path, so
+// that the workspace ACE materializes once per workspace per machine instead
+// of once per invocation:
+//
+//   - the workspace ACE is granted STANDING (never revoked), and
+//   - ensureWorkspaceWriteAcl skips SetNamedSecurityInfoW entirely when the
+//     exact ACE already stands.
+//
+// A per-invocation random identity cannot do this: every run would mint a new
+// SID, so every run would need a fresh ACE (a full eager tree propagation)
+// plus a revoke (a second one), and the leftovers could never be recognized
+// as reusable. Measured on a 373,868-file workspace: grant ~233 s + revoke
+// ~292 s per command.
+
+/**
+ * @brief Domain separator for the workspace identity derivation.
+ *
+ * The derivation is a pure function of the canonical workspace path, so any
+ * two tools deriving an identity the same way would mint the SAME SID for the
+ * same directory — and one tool's cleanup could then revoke the other's
+ * standing grant. A product-specific domain keeps this product's identity
+ * space disjoint from every other derivation.
+ */
+static const char kWorkspaceIdentityDomain[] = "ai-sandbox-workspace";
+
+/**
+ * @brief Resolve a path to its canonical final form.
+ *
+ * Opens the directory (FILE_FLAG_BACKUP_SEMANTICS, no access rights requested)
+ * and asks the filesystem for the final path, which resolves junctions and
+ * symlinks and normalizes case. Falls back to GetFullPathNameW when the handle
+ * cannot be opened, so derivation never fails on a merely unusual path.
+ *
+ * Deriving from the CANONICAL path is what makes two spellings of one
+ * workspace converge on one identity; an as-spelled path would mint a second
+ * identity for the same directory and re-propagate its tree.
+ *
+ * @param path  Input path (may be relative)
+ * @param out   Receives the canonical path (without the \\?\ prefix)
+ * @return true on success
+ */
+static bool canonicalizePath(PCWSTR path, std::wstring& out) {
+    HANDLE h = CreateFileW(path, 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD need = GetFinalPathNameByHandleW(h, NULL, 0,
+                                               FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (need > 0) {
+            std::wstring buf(need, L'\0');
+            DWORD written = GetFinalPathNameByHandleW(h, &buf[0], need,
+                                                      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            CloseHandle(h);
+            if (written > 0 && written < need) {
+                buf.resize(written);
+                // The DOS-volume form is prefixed with \\?\ — strip it so the
+                // derivation input matches the plain spelling callers use.
+                if (buf.compare(0, 4, L"\\\\?\\") == 0) buf.erase(0, 4);
+                out.assign(buf);
+                return true;
+            }
+        } else {
+            CloseHandle(h);
+        }
+    }
+
+    DWORD required = GetFullPathNameW(path, 0, NULL, NULL);
+    if (required == 0) return false;
+    std::wstring buf(required, L'\0');
+    DWORD written = GetFullPathNameW(path, required, &buf[0], NULL);
+    if (written == 0 || written >= required) return false;
+    buf.resize(written);
+    out.assign(buf);
+    return true;
+}
+
+/**
+ * @brief SHA-256 over the domain-separated canonical workspace path.
+ *
+ * @param canonicalWorkspace  Canonical workspace path
+ * @param out                 Receives the 32-byte digest
+ * @return true on success
+ */
+static bool workspaceDigest(PCWSTR canonicalWorkspace, BYTE out[32]) {
+    std::string utf8 = wideToUtf8(canonicalWorkspace);
+    if (utf8.empty()) return false;
+
+    HCRYPTPROV hProv = 0;
+    if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+        return false;
+
+    HCRYPTHASH hHash = 0;
+    BOOL ok = CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash);
+    if (ok) {
+        // sizeof() includes the terminating NUL, which is part of the domain.
+        ok = CryptHashData(hHash, (const BYTE*)kWorkspaceIdentityDomain,
+                           (DWORD)sizeof(kWorkspaceIdentityDomain), 0)
+          && CryptHashData(hHash, (const BYTE*)utf8.data(), (DWORD)utf8.size(), 0);
+    }
+
+    DWORD len = 32;
+    if (ok) ok = CryptGetHashParam(hHash, HP_HASHVAL, out, &len, 0);
+    if (hHash) CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    return ok != FALSE && len == 32;
+}
+
+/**
+ * @brief Derive the workspace's deterministic capability SID (S-1-4-x-y).
+ *
+ * The SID is a pure function of the canonical workspace path, so every
+ * confined execution of the same workspace — across sessions, process
+ * restarts, and calls — carries the SAME write SID. That is what lets the
+ * workspace ACE be granted once per workspace per machine and then reused:
+ * the exact-ACE skip in ensureWorkspaceWriteAcl reduces every later provision
+ * to a single DACL read instead of a full-tree re-propagation.
+ *
+ * Authority 4 (SECURITY_NON_UNIQUE_AUTHORITY) with two 30-bit sub-authorities
+ * is the shape used for locally minted capability SIDs. It is deliberately
+ * distinct from the legacy random S-1-5-10-* namespace, so the zombie sweep
+ * still recognizes and reclaims ACEs left by older builds, while a workspace
+ * capability SID is never treated as stale — it is a standing grant by design.
+ *
+ * @param workspace  Workspace directory path (canonicalized internally)
+ * @param ppSid      Receives the allocated SID (caller must LocalFree)
+ * @return true on success
+ */
+bool deriveWorkspaceSid(PCWSTR workspace, PSID* ppSid) {
+    std::wstring canonical;
+    if (!canonicalizePath(workspace, canonical)) return false;
+
+    BYTE digest[32];
+    if (!workspaceDigest(canonical.c_str(), digest)) return false;
+
+    // Little-endian read of the first two words, folded into 30-bit
+    // sub-authorities (the range S-1-4-x-y carries without overflow).
+    DWORD first = (DWORD)digest[0] | ((DWORD)digest[1] << 8) |
+                  ((DWORD)digest[2] << 16) | ((DWORD)digest[3] << 24);
+    DWORD second = (DWORD)digest[4] | ((DWORD)digest[5] << 8) |
+                   ((DWORD)digest[6] << 16) | ((DWORD)digest[7] << 24);
+    first = (first % 0x3FFFFFFF) + 1;
+    second = (second % 0x3FFFFFFF) + 1;
+
+    WCHAR sz[64];
+    _snwprintf_s(sz, _TRUNCATE, L"S-1-4-%lu-%lu", first, second);
+    return ConvertStringSidToSidW(sz, ppSid) != FALSE;
+}
+
+/**
+ * @brief Check whether a SID is a workspace capability SID (S-1-4-x-y).
+ *
+ * Such a SID names a STANDING grant (the cross-session reuse cache), so the
+ * zombie sweep must never reclaim its ACE: doing so would force the next
+ * invocation to re-propagate the whole workspace tree.
+ *
+ * @param sid  SID to check (may be NULL)
+ * @return true if the SID is in the workspace capability namespace
+ */
+bool isWorkspaceCapabilitySid(PSID sid) {
+    if (!sid) return false;
+    SID_IDENTIFIER_AUTHORITY* auth = GetSidIdentifierAuthority(sid);
+    if (auth->Value[5] != 4) return false;
+    return *GetSidSubAuthorityCount(sid) == 2;
+}
+
+// ============================================================
 //  AppContainer profile helpers (required before CreateProcessInSandbox
 //  because the `identity` parameter must match a registered profile)
 // ============================================================
@@ -272,15 +450,22 @@ static bool buildSandboxSpec(
 #pragma comment(lib, "userenv.lib")  // for CreateAppContainerProfile / DeleteAppContainerProfile
 
 /**
- * @brief Ensure the AppContainer profile for `identity` exists.
+ * @brief Register the AppContainer profile for `identity` for this run.
  *
- * `CreateAppContainerProfile` is idempotent: if the profile already exists it
- * returns HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), which we treat as success.
- * This is required before Experimental_CreateProcessInSandbox will accept the
- * identity; otherwise the engine may fail with ERROR_CALL_NOT_IMPLEMENTED.
+ * Registration is required before Experimental_CreateProcessInSandbox will
+ * accept the identity; otherwise the engine may fail with
+ * ERROR_CALL_NOT_IMPLEMENTED.
+ *
+ * A name collision (or a profile left behind by a crashed launcher) is
+ * reported as FAILURE rather than accepted: the engine rejects a
+ * re-registered identity outright (ERROR_ALREADY_EXISTS, measured even after
+ * DeleteAppContainerProfile released the profile), so accepting it here would
+ * only waste a doomed engine call and turn a clean backend fallback into a
+ * confusing failure. With a fresh random name per run a collision is not
+ * expected in practice.
  *
  * @param identity  Profile name (wide)
- * @return true on success (profile exists), false otherwise
+ * @return true when this call freshly registered the profile
  */
 static bool ensureAppContainerProfile(PCWSTR identity) {
     PSID unusedSid = NULL;
@@ -291,7 +476,15 @@ static bool ensureAppContainerProfile(PCWSTR identity) {
         NULL, 0,              // No extra capabilities
         &unusedSid
     );
-    if (SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+    if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+        fwprintf(stderr,
+                 L"sandbox: [diagnostic] AppContainer profile \"%s\" already registered; "
+                 L"the engine rejects a reused identity, falling back\n", identity);
+        if (unusedSid) FreeSid(unusedSid);
+        return false;
+    }
+
+    if (SUCCEEDED(hr)) {
         if (unusedSid) FreeSid(unusedSid);
         return true;
     }
@@ -304,11 +497,19 @@ static bool ensureAppContainerProfile(PCWSTR identity) {
 /**
  * @brief Build a unique AppContainer profile name for this run.
  *
- * The sandbox engine returns ERROR_ALREADY_EXISTS when `identity` names a
- * profile that is already registered — so a fixed profile name works on the
- * first run and silently falls back to the Restricted Token backend on every
- * run after that. Generate a fresh name per invocation instead and delete the
- * profile once the child has exited.
+ * The name MUST be fresh every run, and this is a hard constraint of the
+ * engine rather than a style choice: `Experimental_CreateProcessInSandbox`
+ * fails with ERROR_ALREADY_EXISTS for any identity whose profile was ever
+ * registered, even after the profile has been deleted again (measured: a
+ * second run with the same name fails, a fresh name succeeds). A workspace
+ * derived name would therefore work exactly once and then demote every later
+ * run to the Restricted Token backend.
+ *
+ * The consequence is structural: an AppContainer identity cannot be reused,
+ * so its derived SID changes every run, so its workspace ACE cannot be granted
+ * standing — every AppContainer invocation pays an eager full-tree grant AND
+ * an eager full-tree revoke. That is why the reusable-grant fast path belongs
+ * to the Restricted Token backend (see deriveWorkspaceSid).
  *
  * Format: `AISandbox-<pid>-<16 hex digits>` — hyphen-separated, as
  * AppContainer profile names reject some punctuation, and short enough to sit
@@ -519,6 +720,10 @@ static bool runWithSandboxApi(
     HANDLE hJob = createKillOnCloseJob();
 
     // 7. Launch the sandboxed process
+    // Clear the last error first: the engine does not always set one, and a
+    // stale value from CreateAppContainerProfile would be misread as the
+    // engine's own failure code.
+    SetLastError(ERROR_SUCCESS);
     PROCESS_INFORMATION pi = {};
     BOOL ok = pfnCreate(
         NULL,               // applicationName (resolve from commandLine)
@@ -539,7 +744,13 @@ static bool runWithSandboxApi(
     LocalFree(cmdCopy);
 
     if (!ok) {
-        // API call failed — fall back to Restricted Token
+        // API call failed — fall back to Restricted Token. Say so: a silent
+        // fallback hides a weaker backend (no read confinement) behind a
+        // success exit code.
+        DWORD apiErr = GetLastError();
+        fwprintf(stderr,
+                 L"sandbox: [diagnostic] Experimental_CreateProcessInSandbox failed "
+                 L"(err=%lu); falling back to the restricted-token backend\n", apiErr);
         cleanupAppContainer();
         if (hJob) CloseHandle(hJob);
         FreeLibrary(hMod);
@@ -581,7 +792,6 @@ static bool runWithSandboxApi(
 // ============================================================
 //  Forward declarations
 // ============================================================
-static bool generateRandomSid(PSID* ppSid);
 static bool ensureWorkspaceWriteAcl(PCWSTR workspace, PSID sid);
 static bool removeWorkspaceWriteAcl(PCWSTR workspace, PSID sid);
 static bool hasExplicitAllowWrite(PACL dacl, PSID sid);
@@ -594,15 +804,23 @@ static void getLockFilePath(PCWSTR workspace, PSID sid, WCHAR* path, DWORD pathS
 static DWORD WINAPI LockUpdateThreadProc(LPVOID lpParameter);
 
 /**
- * @brief Stop the heartbeat thread and roll back granted ACEs / lock files.
+ * @brief Stop the heartbeat thread and release the per-run bookkeeping.
  *
  * Shared by every failure path after step 3 (ACL + lock setup) and by the
  * normal-exit cleanup. Must run before the process exits: the heartbeat
  * thread touches the lock files, so it is terminated first.
  *
+ * The workspace ACE is deliberately NOT revoked. It is the STANDING grant —
+ * the cross-run reuse cache keyed by the workspace's deterministic SID — and
+ * revoking it would force the next invocation to re-propagate the whole
+ * workspace tree (an eager SetNamedSecurityInfoW walk over every descendant,
+ * which dominates the cost of large workspaces). Leaving it in place is safe:
+ * the SID grants nothing on its own, and only a token minted for this
+ * workspace carries it as a restricting SID.
+ *
  * @param hHeartbeatThread  Heartbeat thread handle (may be NULL)
  * @param wWorkspaces       Workspace directories (wide)
- * @param workspaceSid      Sandbox SID whose ACEs / lock files are removed
+ * @param workspaceSid      Workspace capability SID whose lock files are removed
  */
 static void cleanupWorkspaceGrants(
     HANDLE hHeartbeatThread,
@@ -616,7 +834,6 @@ static void cleanupWorkspaceGrants(
     if (CLEANUP_AFTER_EACH_COMMAND) {
         for (const auto& ws : wWorkspaces) {
             deleteLockFile(ws.c_str(), workspaceSid);
-            removeWorkspaceWriteAcl(ws.c_str(), workspaceSid);
         }
     }
 }
@@ -671,25 +888,49 @@ int run(const Config& cfg) {
     // --- Build command line: <shell> <args> <command> ---
     std::wstring cmdLine = shellPath + L" " + shellArgs + wCommand;
 
-    // --- Try modern Windows Sandbox API first (Windows 11 24H2+) ---
-    // Falls back to Restricted Token on older Windows or if the API fails.
-    // SANDBOX_FORCE_RESTRICTED_TOKEN=1 skips the Sandbox API attempt so the
-    // fallback backend can be exercised and tested on 24H2+ machines.
+    // --- Backend selection: the Restricted Token backend is the ONLY active
+    //     backend. ---
+    //
+    // The AppContainer backend (Experimental_CreateProcessInSandbox, i.e. the
+    // mxc BaseContainer tier) is RETIRED from selection. It is not a
+    // performance-tuning choice but a structural incompatibility:
+    //
+    //   - the engine rejects an identity that was ever registered
+    //     (ERROR_ALREADY_EXISTS, measured on a profile that had already been
+    //     deleted), so a profile name must be fresh every run;
+    //   - the derived AppContainer SID follows the name, so the SID changes
+    //     every run;
+    //   - a per-run SID cannot carry a STANDING workspace ACE, so every
+    //     invocation pays an eager full-tree grant AND an eager full-tree
+    //     revoke — the exact cost the deterministic workspace SID exists to
+    //     remove (see deriveWorkspaceSid).
+    //
+    // Its only remaining advantage is read-side default-deny, which this
+    // product does not promise ("reads unaffected") and which cannot be had
+    // without the same wholesale host-DACL mutation. The implementation is
+    // kept intact for reference and for a future engine revision that accepts
+    // a reused identity; set SANDBOX_FORCE_APPCONTAINER=1 to exercise it.
+    // SANDBOX_FORCE_RESTRICTED_TOKEN=1 still means "do not attempt
+    // AppContainer" and therefore wins when both are set.
     {
-        wchar_t forceRt[8];
+        wchar_t flag[8];
         bool forceRestrictedToken =
-            GetEnvironmentVariableW(L"SANDBOX_FORCE_RESTRICTED_TOKEN", forceRt, 8) > 0;
-        int sandboxExitCode = 0;
-        if (!forceRestrictedToken &&
-            runWithSandboxApi(cmdLine, wWorkspaces[0], wWorkspaces, cfg.readOnly,
-                              &sandboxExitCode)) {
-            return sandboxExitCode;
+            GetEnvironmentVariableW(L"SANDBOX_FORCE_RESTRICTED_TOKEN", flag, 8) > 0;
+        bool forceAppContainer =
+            GetEnvironmentVariableW(L"SANDBOX_FORCE_APPCONTAINER", flag, 8) > 0;
+
+        if (forceAppContainer && !forceRestrictedToken) {
+            int sandboxExitCode = 0;
+            if (runWithSandboxApi(cmdLine, wWorkspaces[0], wWorkspaces, cfg.readOnly,
+                                  &sandboxExitCode)) {
+                return sandboxExitCode;
+            }
+            // Engine unavailable or the call failed — fall through.
         }
-        // API unavailable or call failed — fall through to Restricted Token.
     }
 
     // ================================================================
-    //  Fallback: Restricted Token + ACL approach (all Windows versions)
+    //  Restricted Token + ACL backend (the active Windows backend)
     // ================================================================
 
     // --- 1. Open current process token for duplication ---
@@ -700,15 +941,23 @@ int run(const Config& cfg) {
         return 1;
     }
 
-    // --- 2. Generate random workspace SID ---
-    // Doubles as the token's only restricting SID (step 4). In read-only mode
-    // it is never granted any ACE, so every write via the restricted token is
-    // denied (matches Linux/macOS read-only semantics).
+    // --- 2. Derive the workspace capability SID ---
+    // Deterministic per canonical workspace path (deriveWorkspaceSid), so the
+    // workspace ACE materializes once per workspace per machine and every
+    // later invocation reuses it instead of re-propagating the tree. It doubles
+    // as the token's restricting SID for workspace-write (step 4).
+    //
+    // In read-only mode the SID is deliberately NOT added to the restricting
+    // list (step 4). The workspace ACE granted by an earlier workspace-write
+    // period is STANDING and outlives that period, so leaving the SID in the
+    // read-only list would let that stale grant satisfy the restricted write
+    // check and re-open writes. A random per-run SID was inert in read-only
+    // mode because it never had an ACE anywhere; a standing one is not.
     PSID workspaceSid = NULL;
     HANDLE hHeartbeatThread = NULL;
     std::vector<std::pair<std::wstring, PSID>> wsList;
-    if (!generateRandomSid(&workspaceSid)) {
-        fwprintf(stderr, L"sandbox: SID generation failed\n");
+    if (!deriveWorkspaceSid(wWorkspaces[0].c_str(), &workspaceSid)) {
+        fwprintf(stderr, L"sandbox: workspace SID derivation failed\n");
         CloseHandle(hToken);
         return 1;
     }
@@ -811,9 +1060,16 @@ int run(const Config& cfg) {
                  logonSid != NULL, everyoneSid != NULL);
     }
 
+    // The restricting set gates write-class accesses only (WRITE_RESTRICTED):
+    // a write must clear both the normal check and this one. The logon SID and
+    // Everyone are keep-alive invariants — without them child initialization
+    // fails — so they are present in both modes. The workspace capability SID
+    // is present ONLY in workspace-write: its ACE is standing, so carrying it
+    // under read-only would let a grant left over from an earlier
+    // workspace-write period satisfy the restricted check.
     SID_AND_ATTRIBUTES restrictingSids[3] = {};
     DWORD numRestricting = 0;
-    restrictingSids[numRestricting++].Sid = workspaceSid;
+    if (!cfg.readOnly) restrictingSids[numRestricting++].Sid = workspaceSid;
     if (logonSid)    restrictingSids[numRestricting++].Sid = logonSid;
     if (everyoneSid) restrictingSids[numRestricting++].Sid = everyoneSid;
 
@@ -902,7 +1158,8 @@ int run(const Config& cfg) {
     CloseHandle(hRestrictedToken);
     if (hJob) CloseHandle(hJob);
 
-    // --- 8. Stop heartbeat thread and clean up ACEs / lock files ---
+    // --- 8. Stop heartbeat thread and drop the per-run lock files. The
+    //        workspace ACE is left standing (the cross-run reuse cache). ---
     if (!cfg.readOnly) {
         cleanupWorkspaceGrants(hHeartbeatThread, wWorkspaces, workspaceSid);
     }
@@ -918,38 +1175,16 @@ int run(const Config& cfg) {
 // ============================================================
 
 /**
- * @brief Generate a cryptographically random SID for sandbox identification.
+ * @brief Check whether a SID belongs to the legacy sandbox namespace (S-1-5-10-*).
  *
- * Uses CryptGenRandom to produce 128 bits of randomness, formatted as
- * S-1-5-10-{rand}-{rand}-{rand}-{rand}. The S-1-5-10 prefix (Security/NT Authority
- * sub-authority 10) is repurposed as a sandbox-specific namespace.
- *
- * @param ppSid  Output pointer to receive the allocated SID (caller must LocalFree)
- * @return true on success, false on failure
- */
-bool generateRandomSid(PSID* ppSid) {
-    HCRYPTPROV hProv = 0;
-    if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
-        return false;
-    DWORD randVals[4];
-    if (!CryptGenRandom(hProv, sizeof(randVals), (BYTE*)randVals)) {
-        CryptReleaseContext(hProv, 0); return false;
-    }
-    CryptReleaseContext(hProv, 0);
-    WCHAR sz[64];
-    _snwprintf_s(sz, _TRUNCATE, L"S-1-5-10-%lu-%lu-%lu-%lu",
-                  randVals[0], randVals[1], randVals[2], randVals[3]);
-    return ConvertStringSidToSidW(sz, ppSid) != FALSE;
-}
-
-/**
- * @brief Check whether a SID belongs to the sandbox namespace (S-1-5-10-*).
- *
- * Used to identify and clean up stale ACEs left by previous sandbox invocations
- * that crashed before cleanup.
+ * Older builds minted a random S-1-5-10-* SID per invocation and revoked its
+ * ACE on exit. An ACE in this namespace that is not the current SID is
+ * therefore residue from a build that crashed (or was killed) before cleanup,
+ * and the sweep may reclaim it. The current workspace SID lives in a different
+ * namespace on purpose — see deriveWorkspaceSid and isWorkspaceCapabilitySid.
  *
  * @param sid  SID to check (may be NULL)
- * @return true if the SID is in the sandbox namespace, false otherwise
+ * @return true if the SID is in the legacy sandbox namespace, false otherwise
  */
 bool isSandboxSid(PSID sid) {
     if (!sid) return false;
@@ -1141,16 +1376,103 @@ bool hasExplicitAllowWrite(PACL dacl, PSID sid) {
 }
 
 /**
+ * @brief Per-path exclusive lock serializing DACL mutations on one workspace.
+ *
+ * The grant/revoke sequence is a read-merge-write of the directory's DACL and
+ * is therefore not safe to run concurrently with itself: two invocations that
+ * both read the DACL before either writes can lose each other's changes. The
+ * lock is a real cross-PROCESS lock (LockFileEx on a lock file inside the
+ * workspace) because the concurrent invocations are separate sandbox.exe
+ * processes, not threads.
+ *
+ * It also removes the worst concurrency cost. Without it, N simultaneous first
+ * commands on a workspace all observe "no ACE yet" and all call
+ * SetNamedSecurityInfoW, each triggering its own eager full-tree propagation
+ * over the same tree. With it, the first invocation propagates while the rest
+ * wait, then find the exact ACE standing and take the O(1) skip.
+ *
+ * Acquisition is bounded: a peer's first grant legitimately takes minutes on a
+ * large workspace, so the budget is generous, but a peer that died holding the
+ * lock must not hang the sandbox forever. Failure to acquire is reported to the
+ * caller, which fails closed rather than mutating the DACL unlocked.
+ */
+class AclPathLock {
+public:
+    AclPathLock() : handle_(INVALID_HANDLE_VALUE) {
+        ZeroMemory(&overlapped_, sizeof(overlapped_));
+    }
+
+    ~AclPathLock() { release(); }
+
+    AclPathLock(const AclPathLock&) = delete;
+    AclPathLock& operator=(const AclPathLock&) = delete;
+
+    /**
+     * @brief Create/open the lock file and take an exclusive lock on it.
+     * @param workspace  Workspace directory whose DACL will be mutated
+     * @return true when the lock is held
+     */
+    bool acquire(PCWSTR workspace) {
+        WCHAR lockDir[MAX_PATH];
+        _snwprintf_s(lockDir, _TRUNCATE, L"%s\\.sandbox", workspace);
+        CreateDirectoryW(lockDir, NULL);
+
+        WCHAR lockPath[MAX_PATH];
+        _snwprintf_s(lockPath, _TRUNCATE, L"%s\\acl.lock", lockDir);
+
+        handle_ = CreateFileW(lockPath, GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+        if (handle_ == INVALID_HANDLE_VALUE) return false;
+
+        // Zeroed OVERLAPPED means "lock byte 0"; retry rather than block so the
+        // wait can be bounded. LOCKFILE_FAIL_IMMEDIATELY makes a held lock
+        // return ERROR_LOCK_VIOLATION instead of blocking.
+        const DWORD deadline = GetTickCount() + ACL_LOCK_TIMEOUT_MS;
+        for (;;) {
+            if (LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                           0, 1, 0, &overlapped_)) {
+                return true;
+            }
+            if (GetLastError() != ERROR_LOCK_VIOLATION) break;
+            if ((LONG)(GetTickCount() - deadline) >= 0) break;
+            Sleep(ACL_LOCK_RETRY_MS);
+        }
+
+        CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+        return false;
+    }
+
+    /** @brief Release the lock (idempotent). */
+    void release() {
+        if (handle_ == INVALID_HANDLE_VALUE) return;
+        UnlockFileEx(handle_, 0, 1, 0, &overlapped_);
+        CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+    }
+
+private:
+    HANDLE handle_;
+    OVERLAPPED overlapped_;
+};
+
+/**
  * @brief Grant write access for a SID on a workspace directory.
  *
  * Performs two steps:
  *   1. Remove stale ("zombie") sandbox SIDs from the DACL — these are ACEs
  *      left by previous sandbox invocations that crashed before cleanup.
- *      A SID is considered stale if it is a sandbox SID, is not the current
- *      SID, and its lock file has expired.
+ *      A SID is considered stale if it is a legacy sandbox SID, is not the
+ *      current SID, is not a standing workspace capability SID, and its lock
+ *      file has expired.
  *   2. Add a kWorkspaceGrantMask ACE (write + execute + delete + child
  *      deletion, no WRITE_DAC/WRITE_OWNER) for the current SID if
  *      one does not already exist.
+ *
+ * The whole sequence runs under the per-path lock (see AclPathLock), and when
+ * the DACL is already in its target state the apply is skipped entirely — the
+ * ACE is a standing, deterministic grant, so that is the steady state.
  *
  * The ACE is inherited by all files and subdirectories within the workspace.
  *
@@ -1160,6 +1482,12 @@ bool hasExplicitAllowWrite(PACL dacl, PSID sid) {
  */
 
 bool ensureWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
+    // Serialize the whole read-decide-write sequence against peer sandbox
+    // processes. Fail closed: mutating the DACL unlocked could lose a peer's
+    // concurrent change, and a lock that cannot be taken means the state is
+    // unknown.
+    AclPathLock pathLock;
+    if (!pathLock.acquire(workspace)) return false;
     PACL dacl = NULL;
     PSECURITY_DESCRIPTOR sd = NULL;
     DWORD err = GetNamedSecurityInfoW(
@@ -1180,10 +1508,39 @@ bool ensureWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
         PSID aceSid = (ace->AceType == ACCESS_ALLOWED_ACE_TYPE)
             ? (PSID)&((ACCESS_ALLOWED_ACE*)ace)->SidStart
             : (PSID)&((ACCESS_ALLOWED_CALLBACK_ACE*)ace)->SidStart;
-        // Keep non-sandbox SIDs, the current SID, and active sandbox SIDs
-        if (!isSandboxSid(aceSid) || EqualSid(aceSid, sid) || isSidActive(workspace, aceSid)) {
+        // Keep non-sandbox SIDs, the current SID, active sandbox SIDs, and
+        // workspace capability SIDs. The last clause is explicit on purpose: a
+        // workspace capability SID is a STANDING grant (the cross-run reuse
+        // cache) and must never be reclaimed as stale. Today isSandboxSid only
+        // matches the legacy S-1-5-10-* namespace, which makes the clause
+        // redundant — but anyone broadening that predicate (for example to also
+        // recognize the AppContainer namespace, which the sweep currently
+        // misses) would otherwise silently start deleting the cache and
+        // re-introduce the full-tree re-propagation.
+        if (!isSandboxSid(aceSid) || EqualSid(aceSid, sid) ||
+            isWorkspaceCapabilitySid(aceSid) || isSidActive(workspace, aceSid)) {
             keepCount++;
         }
+    }
+
+    // --- Fast path: the DACL is already in its target state ---
+    // The exact grant ACE stands and no zombie ACE needs reclaiming, so there
+    // is nothing to write. This is the steady state from the second invocation
+    // on, and it is the entire point of deriving the SID from the workspace:
+    // SetNamedSecurityInfoW applies eager inheritance, so calling it would walk
+    // and re-stamp every descendant (minutes on a large workspace) even though
+    // the resulting DACL is byte-identical.
+    bool exactStands = hasExplicitAllowWrite(dacl, sid);
+    if (GetEnvironmentVariableW(L"SANDBOX_ACL_DIAG", NULL, 0) > 0) {
+        WCHAR* sidStr = NULL;
+        ConvertSidToStringSidW(sid, &sidStr);
+        fwprintf(stderr, L"[acl-diag] sid=%s exact=%d keep=%lu/%lu\n",
+                 sidStr ? sidStr : L"?", exactStands ? 1 : 0, keepCount, dacl->AceCount);
+        if (sidStr) LocalFree(sidStr);
+    }
+    if (keepCount == dacl->AceCount && exactStands) {
+        LocalFree(sd);
+        return true;
     }
 
     // Rebuild DACL without zombie SIDs if any were found
@@ -1210,8 +1567,10 @@ bool ensureWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
                 PSID aceSid = (ace->AceType == ACCESS_ALLOWED_ACE_TYPE)
                     ? (PSID)&((ACCESS_ALLOWED_ACE*)ace)->SidStart
                     : (PSID)&((ACCESS_ALLOWED_CALLBACK_ACE*)ace)->SidStart;
-                // Keep non-sandbox SIDs, current SID, and active sandbox SIDs
-                if (!isSandboxSid(aceSid) || EqualSid(aceSid, sid) || isSidActive(workspace, aceSid)) {
+                // Keep non-sandbox SIDs, the current SID, active sandbox SIDs,
+                // and standing workspace capability SIDs (see step 1).
+                if (!isSandboxSid(aceSid) || EqualSid(aceSid, sid) ||
+                    isWorkspaceCapabilitySid(aceSid) || isSidActive(workspace, aceSid)) {
                     AddAce(cleanedDacl, ACL_REVISION, MAXDWORD, ace, ace->AceSize);
                 }
             }
@@ -1254,16 +1613,27 @@ bool ensureWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
 }
 
 /**
- * @brief Remove the sandbox SID's write ACE from a workspace directory's DACL.
+ * @brief Remove a capability SID's ACE from a directory's DACL.
+ *
+ * Used by the AppContainer backend, whose identity is fresh every run: there
+ * the ACE is per-run state and must be revoked, or each invocation would leave
+ * a dead entry behind. The Restricted Token backend deliberately does NOT call
+ * this — its ACE is the standing cross-run reuse cache, and revoking it would
+ * force the next invocation to re-propagate the whole workspace tree.
  *
  * Rebuilds the DACL without any ACE matching the given SID, then applies it
- * back to the directory. Called during cleanup after the command completes.
+ * back to the directory. Note that the apply re-propagates through the tree.
  *
  * @param workspace  Workspace directory path
- * @param sid        Sandbox SID whose ACE should be removed
+ * @param sid        Capability SID whose ACE should be removed
  * @return true on success, false on failure
  */
 bool removeWorkspaceWriteAcl(PCWSTR workspace, PSID sid) {
+    // Same per-path lock as the grant path: revoking is the mirror of granting
+    // and must not interleave with a peer's read-merge-write.
+    AclPathLock pathLock;
+    if (!pathLock.acquire(workspace)) return false;
+
     PACL dacl = NULL;
     PSECURITY_DESCRIPTOR sd = NULL;
     DWORD err = GetNamedSecurityInfoW(

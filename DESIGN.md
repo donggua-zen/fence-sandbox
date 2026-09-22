@@ -11,7 +11,7 @@
 
 | 平台 | 沙盒机制 | 核心思路 |
 |------|---------|---------|
-| Windows | Restricted Token + ACL | 生成随机 SID，仅授予该 SID 对工作目录的写权限，用受限令牌启动子进程 |
+| Windows | Restricted Token + ACL | 由工作区路径确定性派生能力 SID，授予该 SID 对工作目录的**常驻**写权限，用受限令牌启动子进程 |
 | Linux | Landlock LSM | 创建 Landlock ruleset 限制写操作，为工作目录添加"允许写入"规则 |
 | macOS | sandbox-exec (Seatbelt) | 生成动态 SBPL profile，默认放行一切、仅拒绝工作目录之外的写入 |
 
@@ -19,16 +19,26 @@
 
 ### 流程
 
-1. **生成随机 SID**：每次执行通过 `CryptGenRandom` 生成 `S-1-5-10-{rand}-{rand}-{rand}-{rand}` 格式的唯一标识
-2. **授予写权限**：将该 SID 的 `GENERIC_WRITE | GENERIC_EXECUTE` ACE 添加到工作目录的 DACL
-3. **创建 Restricted Token**：用 `CreateRestrictedToken` + `WRITE_RESTRICTED` 限制令牌，添加 `Everyone` SID 作为 restricting SID，使子进程仅能写该 SID 有权访问的目录
+1. **派生工作区 SID**：由规范化工作区路径确定性派生 `S-1-4-{x}-{y}`（`sha256("ai-sandbox-workspace\0" + canonical path)` 取前两字折叠为 30 位子授权）。同一工作区跨会话、跨进程重启、跨调用始终是同一身份——这是「授权可复用」的前提
+2. **授予写权限（常驻）**：将该 SID 的显式掩码 ACE（写 + 执行 + 删除 + 子项删除，剔除 `WRITE_DAC | WRITE_OWNER`）添加到工作目录的 DACL，并**保留不回收**——该 ACE 即跨调用复用缓存
+3. **创建 Restricted Token**：用 `CreateRestrictedToken` + `WRITE_RESTRICTED` 限制令牌，restricting SID 为 `[工作区 SID, logon SID, Everyone]`（只读模式为 `[logon SID, Everyone]`），使子进程仅能写该 SID 有权访问的目录
 4. **启动子进程**：用 `CreateProcessAsUserW` 以受限令牌执行 `powershell.exe -NoProfile -NonInteractive -Command <命令>`（`--shell cmd` 切换为 `cmd.exe /c`）
-5. **清理**：执行完毕后删除 ACE 和 lock 文件
+5. **收尾**：删除 lock 文件；**不回收工作区 ACE**
+
+### 为什么授权是常驻的（以及并发）
+
+`SetNamedSecurityInfoW` 写继承型 ACE 时会**立即遍历每个后代**（eager inheritance）——大工作区上实测单次授权约 233 s、单次回收约 292 s。工作区身份既然是确定性的，就没有理由每条命令都付这两遍：授权一次后，`ensureWorkspaceWriteAcl` 检测到「精确 ACE 已存在且无僵尸 ACE」就**完全跳过 `SetNamedSecurityInfoW`**，只读一次 DACL，每条命令 ACL 成本降为 O(1)。工作区改名会派生新 SID，旧 ACE 成为惰性残留。
+
+并发下在 `<workspace>\.sandbox\acl.lock` 上用 `LockFileEx` 加**跨进程**独占锁，把 DACL 的「读-判定-写」整段串行化：既避免并发丢更新，也让 N 条并发首命令只做一次传播（其余等待后命中快路径）。
 
 ### 心跳与僵尸清理
 
 - 后台线程每 10 分钟更新 lock 文件时间戳
-- 每次启动时自动清理超过 30 分钟未更新的残留 ACE
+- 每次启动时自动清理超过 30 分钟未更新的残留 ACE；清理**只针对旧随机命名空间（`S-1-5-10-*`）**，工作区能力 SID（`S-1-4-*`）被显式排除、永不回收（回收等于删掉缓存）
+
+### 只读模式的一个陷阱
+
+只读模式的 restricting SID 列表**不含**工作区能力 SID。该 SID 的 ACE 是常驻的，若把它留在只读列表里，上一次 `workspace-write` 留下的授权会满足受限写检查、把只读重新打开。随机的每次调用 SID 原本在只读模式下天然惰性（它从来没有 ACE），确定性 SID 不是——这是引入确定性身份时必须同时处理的问题。
 
 ### 为什么不用低完整性（Low Integrity）？
 

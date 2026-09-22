@@ -12,6 +12,13 @@ if(WIN32)
     add_test(NAME security_tests
         COMMAND "${CMAKE_CURRENT_LIST_DIR}/test_security_windows.bat" "$<TARGET_FILE:sandbox>"
     )
+    # Standing workspace grant: the capability ACE must survive the run that
+    # created it, keep its SID across runs, and must not re-open writes when a
+    # later read-only run targets the same workspace. cmd-only, so it needs
+    # none of the default-shell skips below.
+    add_test(NAME standing_grant_tests
+        COMMAND "${CMAKE_CURRENT_LIST_DIR}/test_standing_grant_windows.bat" "$<TARGET_FILE:sandbox>"
+    )
     set_tests_properties(integration_tests security_tests PROPERTIES
         ENVIRONMENT "SANDBOX_TEST_SKIP_DEFAULT_SHELL=1;SANDBOX_TEST_SKIP_DELETE_OUTSIDE=1"
     )

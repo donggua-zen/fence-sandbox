@@ -4,6 +4,35 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Changed
+- Windows（Restricted Token 后端）：工作区 ACE 从「每次调用随机 SID + 授权 + 回收」改为**按工作区确定性派生 + 常驻授权 + 命中即跳过**。原先每次命令都要付**两遍** eager 全树传播（`SetNamedSecurityInfoW` 会立即遍历每个后代，实测大工作区上授权 ≈233 s、回收 ≈292 s，合计 ~525 s/条），现在只在**每台机器每个工作区**付一次，之后每条命令的 ACL 成本降到一次 DACL 读取
+  - 新增 `deriveWorkspaceSid()`：`sha256("ai-sandbox-workspace\0" + 规范化工作区路径)` → `S-1-4-x-y`。路径先经 `GetFinalPathNameByHandleW` 规范化，保证同一目录的不同拼写收敛到同一身份；域名前缀保证与其它产品（如 deepseek-harness 的 windows-acl 沙盒）派生的能力 SID 不冲突
+  - 工作区 ACE 改为**常驻**（`cleanupWorkspaceGrants` 不再回收）——它就是跨调用复用缓存；回收会迫使下一次调用重新传播整棵树
+  - `ensureWorkspaceWriteAcl` 新增**快路径**：读到的 DACL 已含精确 ACE 且无僵尸 ACE 时，**完全跳过 `SetNamedSecurityInfoW`**
+  - `isSandboxSid()` 语义收敛为「旧随机命名空间（`S-1-5-10-*`）」，新增 `isWorkspaceCapabilitySid()`（`S-1-4-x-y`）；僵尸清理显式**永不回收**工作区能力 SID（否则等于删掉缓存）
+  - 新增 `AclPathLock`：以 `LockFileEx` 对 `<workspace>\.sandbox\acl.lock` 加**跨进程**独占锁，把 DACL 的读-改-写整段串行化。既修掉并发丢更新，也让 N 条并发首命令只做**一次**传播（其余在锁上等待后命中快路径），而不是各做一次
+
+### Fixed
+- Windows（Restricted Token 后端，**安全**）：`--read-only` 的 restricting SID 列表不再包含工作区能力 SID。该 SID 的 ACE 是常驻的，若仍留在只读列表里，**上一次 workspace-write 留下的授权会满足受限写检查、把只读重新打开**。改为只读列表 = `[logon SID, Everyone]`（与 deepseek-harness 同构）。随机的每次调用 SID 原本在只读模式下天然惰性（它从来没有 ACE），确定性 SID 不是——这是本次改动引入的、必须同时修掉的陷阱，已加回归测试
+- Windows（AppContainer 后端）：`Experimental_CreateProcessInSandbox` 失败时**不再静默回退**，改为打印 `[diagnostic] ... falling back to the restricted-token backend`。静默回退会把「没有读隔离」的弱后端藏在成功退出码后面
+- Windows（AppContainer 后端）：调用引擎前 `SetLastError(ERROR_SUCCESS)`，否则 `CreateAppContainerProfile` 遗留的错误码会被误读成引擎自身的失败码
+- Windows（AppContainer 后端）：`CreateAppContainerProfile` 返回 `ERROR_ALREADY_EXISTS` 时按**失败**处理（原为按成功）。实测引擎对「曾经注册过」的 identity 一律拒绝启动，接受它只会浪费一次注定失败的引擎调用
+
+### Added
+- `sandbox/tests/test_standing_grant_windows.bat` + CTest 用例 `standing_grant_tests`（10 项）：钉住两个后端各自的授权生命周期——Restricted Token 的能力 ACE **常驻且跨运行 SID 稳定**；AppContainer 的每次运行 ACE **被回收、不累积**；以及两者共有的安全用例「同一工作区先 workspace-write 再 `--read-only` 必须仍然拒绝写入」
+- 环境变量 `SANDBOX_ACL_DIAG=1`：在 stderr 打印每次 `ensureWorkspaceWriteAcl` 的判定（`sid=` / `exact=` / `keep=N/M`），用于定位「为什么这次没有命中快路径」
+- 环境变量 `SANDBOX_FORCE_APPCONTAINER=1`：显式启用已退役的 AppContainer 后端（仅供实验/回归）
+
+### Retired
+- Windows：**AppContainer 后端（`Experimental_CreateProcessInSandbox` / mxc BaseContainer 层）退出默认选择路径**。代码保留（`runWithSandboxApi` 等完整可用，`SANDBOX_FORCE_APPCONTAINER=1` 可启用），但默认一律走 Restricted Token 后端
+  - 原因是**结构性不兼容**而非性能调参：引擎对「曾经注册过」的 identity 一律返回 `ERROR_ALREADY_EXISTS`（在 profile 已被 `DeleteAppContainerProfile` 删除后实测仍然如此），因此 profile 名必须每次运行全新 → 派生 SID 每次运行变化 → 工作区 ACE 无法常驻 → **每次调用都要付两遍 eager 全树传播**，正是确定性工作区 SID 要消除的那笔成本
+  - 即：该 API 的 identity 语义是「一次性、唯一命名的容器实例」，不是「可复用的账户引用」。对「同一工作区反复执行大量短命令」的 agent 场景属于用法错配
+  - 其唯一剩余优势是**读侧默认拒绝**，而本产品的语义明确只承诺写隔离（「读取不受影响」），且要拿到读侧隔离同样需要对每个待读路径改 host DACL——即同一笔批发式 DACL 变更成本
+  - `SANDBOX_FORCE_RESTRICTED_TOKEN=1` 语义不变（「不要尝试 AppContainer」），两者同时设置时它优先
+  - 若未来引擎版本接受复用 identity，把该分支恢复为默认即可（代码路径未删）
+
 ## [1.2.0] - 2026-09-18
 
 ### Changed
