@@ -31,8 +31,15 @@ jobs:
           - os: ubuntu-latest
             artifact: linux
             binary: sandbox
-          - os: macos-latest
-            artifact: macos
+          # Both mac jobs are pinned to the macOS 15 image generation: the
+          # arm64 label (macos-latest is arm64 nowadays) and the standard
+          # (free) Intel label. Pinning keeps the toolchain deterministic and
+          # valid for the project's 11.0 deployment-target floor.
+          - os: macos-15
+            artifact: macos-arm64
+            binary: sandbox
+          - os: macos-15-intel
+            artifact: macos-x64
             binary: sandbox
 
     steps:
@@ -77,9 +84,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # OS/ARCH come from the runner, not the matrix entry, so names stay
+          # fence-sandbox-<os>-<arch>.tar.gz (e.g. macos-arm64, macos-x64).
+          OS=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
           ARCH=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
           mkdir -p dist
-          tar -czf "dist/fence-sandbox-${{ matrix.artifact }}-${ARCH}.tar.gz" \
+          tar -czf "dist/fence-sandbox-${OS}-${ARCH}.tar.gz" \
             -C build/bin "${{ matrix.binary }}"
           ls -la dist/
 

@@ -27,7 +27,7 @@
 |------|------|
 | Windows | Vista 及以上（x64） |
 | Linux | 内核 ≥ 5.13，Docker ≥ 20.10.21（如在容器内运行） |
-| macOS | macOS 10.10+（自带 `/usr/bin/sandbox-exec`）。注意：`sandbox-exec` 自 macOS 10.15 起被 Apple 标记为 deprecated，但当前仍可用 |
+| macOS | macOS 11.0+（自带 `/usr/bin/sandbox-exec`）。注意：`sandbox-exec` 自 macOS 10.15 起被 Apple 标记为 deprecated，但当前仍可用 |
 
 无需额外运行时依赖。构建工具：CMake 3.20+、C++17 编译器（MSVC 2022+ / GCC 12+）。
 
@@ -63,6 +63,17 @@ cmake --build build --config Release
 docker build -t sandbox-dev -f sandbox/docker/Dockerfile .
 docker run --rm -v "$(pwd):/workspace" sandbox-dev bash -c "cd /workspace && bash build_project.sh"
 ```
+
+### macOS
+
+```bash
+cmake -S sandbox -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
+
+输出：`build/bin/sandbox`。默认最低部署目标为 macOS 11.0，可用 `-DCMAKE_OSX_DEPLOYMENT_TARGET=` 覆盖；在 Apple Silicon 上交叉编译 Intel 版本可加 `-DCMAKE_OSX_ARCHITECTURES=x86_64`。
+
+发布产物由 GitHub Actions 自动构建（CI 在 Intel runner 上原生构建并跑测试）：`fence-sandbox-macos-arm64.tar.gz`（Apple Silicon）与 `fence-sandbox-macos-x64.tar.gz`（Intel）。
 
 ## 使用
 

@@ -21,9 +21,13 @@
 - Windows（AppContainer 后端）：`CreateAppContainerProfile` 返回 `ERROR_ALREADY_EXISTS` 时按**失败**处理（原为按成功）。实测引擎对「曾经注册过」的 identity 一律拒绝启动，接受它只会浪费一次注定失败的引擎调用
 
 ### Added
+- macOS Intel (x86_64) 构建与打包：Release 工作流新增 `macos-15-intel` 任务（GitHub 标准免费 Intel runner，原生构建+原生跑测试），产物 `fence-sandbox-macos-x64.tar.gz`；CI 新增 `macos-intel` 任务防止该目标回归。`macos-latest` 现为 arm64（且在持续迁移，当前为 macOS 26），此前发布只有 `fence-sandbox-macos-arm64.tar.gz`；两个 macOS 任务统一钉在 macOS 15 镜像代（`macos-15` / `macos-15-intel`），工具链确定且满足 11.0 部署目标下限
 - `sandbox/tests/test_standing_grant_windows.bat` + CTest 用例 `standing_grant_tests`（10 项）：钉住两个后端各自的授权生命周期——Restricted Token 的能力 ACE **常驻且跨运行 SID 稳定**；AppContainer 的每次运行 ACE **被回收、不累积**；以及两者共有的安全用例「同一工作区先 workspace-write 再 `--read-only` 必须仍然拒绝写入」
 - 环境变量 `SANDBOX_ACL_DIAG=1`：在 stderr 打印每次 `ensureWorkspaceWriteAcl` 的判定（`sid=` / `exact=` / `keep=N/M`），用于定位「为什么这次没有命中快路径」
 - 环境变量 `SANDBOX_FORCE_APPCONTAINER=1`：显式启用已退役的 AppContainer 后端（仅供实验/回归）
+
+### Changed
+- macOS：显式设置最低部署目标 11.0（`CMAKE_OSX_DEPLOYMENT_TARGET`，未设置时生效，可被 `-D` 覆盖）。此前跟随构建机的系统版本，在 macOS 15/26 runner 上产出的二进制会要求系统版本过新，Intel Mac 客户机无法运行；README 的系统要求同步由 10.10+ 修正为 11.0+
 
 ### Retired
 - Windows：**AppContainer 后端（`Experimental_CreateProcessInSandbox` / mxc BaseContainer 层）退出默认选择路径**。代码保留（`runWithSandboxApi` 等完整可用，`SANDBOX_FORCE_APPCONTAINER=1` 可启用），但默认一律走 Restricted Token 后端

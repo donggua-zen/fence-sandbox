@@ -51,8 +51,31 @@ jobs:
       - name: Test
         working-directory: build
         run: ctest --output-on-failure
+  # Pinned to the macOS 15 image generation: macos-latest is arm64 and keeps
+  # migrating (macOS 26 at the time of writing), and the pin keeps the
+  # toolchain deterministic and valid for the project's 11.0 deployment-target
+  # floor.
   macos:
-    runs-on: macos-latest
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S sandbox -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+  # The release pipeline ships a macOS Intel (x86_64) artifact built on
+  # macos-15-intel; this job keeps that target building and passing tests on
+  # pull requests. It is the only place x86_64 macOS code is exercised.
+  macos-intel:
+    runs-on: macos-15-intel
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
